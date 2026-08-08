@@ -82,6 +82,7 @@ schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semantic_graph.workspace = true
 settings.workspace = true
 sha2.workspace = true
 shellexpand.workspace = true
