@@ -141,6 +141,25 @@ impl Node {
         }
     }
 
+    pub fn subsystem(
+        id: NodeId,
+        key: NodeKey,
+        display_name: impl Into<SharedString>,
+        payload: SubsystemPayload,
+        flags: NodeFlags,
+    ) -> Self {
+        Self {
+            id,
+            key,
+            kind: NodeKind::Subsystem,
+            display_name: display_name.into(),
+            abbrev: None,
+            location: None,
+            payload: NodePayload::Subsystem(payload),
+            flags,
+        }
+    }
+
     pub fn entry(
         id: NodeId,
         key: NodeKey,

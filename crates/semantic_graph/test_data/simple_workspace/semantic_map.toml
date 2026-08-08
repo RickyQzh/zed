@@ -1,0 +1,3 @@
+[subsystems.ui]
+members = ["crates/app"]
+summary = "Application binary"
