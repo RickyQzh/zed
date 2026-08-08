@@ -237,6 +237,7 @@ pub struct Project {
     context_server_store: Entity<ContextServerStore>,
     image_store: Entity<ImageStore>,
     lsp_store: Entity<LspStore>,
+    semantic_graph: Entity<semantic_graph::SemanticGraphStore>,
     _subscriptions: Vec<gpui::Subscription>,
     buffers_needing_diff: HashSet<WeakEntity<Buffer>>,
     git_diff_debouncer: DebouncedDelay<Self>,
@@ -1339,6 +1340,9 @@ impl Project {
                 )
             });
 
+            let semantic_graph =
+                cx.new(|cx| semantic_graph::SemanticGraphStore::new(cx));
+
             cx.subscribe(&lsp_store, Self::on_lsp_store_event).detach();
 
             Self {
@@ -1348,6 +1352,7 @@ impl Project {
                 buffer_store,
                 image_store,
                 lsp_store,
+                semantic_graph,
                 context_server_store,
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
@@ -1565,6 +1570,9 @@ impl Project {
                 )
             });
 
+            let semantic_graph =
+                cx.new(|cx| semantic_graph::SemanticGraphStore::new(cx));
+
             cx.subscribe(&remote, Self::on_remote_client_event).detach();
 
             let this = Self {
@@ -1574,6 +1582,7 @@ impl Project {
                 buffer_store,
                 image_store,
                 lsp_store,
+                semantic_graph,
                 context_server_store,
                 bookmark_store,
                 breakpoint_store,
@@ -1842,6 +1851,9 @@ impl Project {
                 ContextServerStore::local(worktree_store.clone(), Some(weak_self), false, cx)
             });
 
+            let semantic_graph =
+                cx.new(|cx| semantic_graph::SemanticGraphStore::new(cx));
+
             let mut worktrees = Vec::new();
             for worktree in response.payload.worktrees {
                 let worktree = Worktree::remote(
@@ -1876,6 +1888,7 @@ impl Project {
                 image_store,
                 worktree_store: worktree_store.clone(),
                 lsp_store: lsp_store.clone(),
+                semantic_graph,
                 context_server_store,
                 active_entry: None,
                 collaborators: Default::default(),
@@ -2200,6 +2213,10 @@ impl Project {
     #[inline]
     pub fn lsp_store(&self) -> Entity<LspStore> {
         self.lsp_store.clone()
+    }
+
+    pub fn semantic_graph(&self) -> &Entity<semantic_graph::SemanticGraphStore> {
+        &self.semantic_graph
     }
 
     #[inline]
