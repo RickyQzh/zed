@@ -65,23 +65,12 @@ impl PanelViewModel {
 
 impl CanvasViewModel {
     pub fn from_snapshot(snapshot: &SemanticGraphSnapshot, lens: &Lens) -> Self {
-        let mut canvas_nodes = Vec::new();
-        let Some(root_id) = resolve_root(&snapshot.graph, lens) else {
-            return Self::default();
-        };
-        collect_canvas_nodes(
-            root_id,
-            0,
-            &snapshot.graph,
-            snapshot.intents.as_ref(),
-            lens,
-            &mut canvas_nodes,
-        );
-
+        // Only include nodes that hierarchy layout positions. Nested modules that
+        // DFS would visit but layout does not place are intentionally omitted.
         let positions = hierarchy::layout(&snapshot.graph, lens);
-        let mut nodes = Vec::with_capacity(canvas_nodes.len());
-        for (node_id, node, subtitle) in canvas_nodes {
-            let Some(&(x, y)) = positions.get(&node_id) else {
+        let mut nodes = Vec::with_capacity(positions.len());
+        for (&node_id, &(x, y)) in &positions {
+            let Some(node) = snapshot.graph.nodes.get(&node_id) else {
                 continue;
             };
             nodes.push(SceneNode {
@@ -92,14 +81,24 @@ impl CanvasViewModel {
                     size: size(NODE_WIDTH, NODE_HEIGHT),
                 },
                 title: node.display_name.clone(),
-                subtitle,
+                subtitle: intent_summary(snapshot.intents.as_ref(), node_id),
             });
         }
+        nodes.sort_by(|a, b| {
+            a.rect
+                .origin
+                .y
+                .total_cmp(&b.rect.origin.y)
+                .then_with(|| a.rect.origin.x.total_cmp(&b.rect.origin.x))
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
-        let edge_kinds = &lens.edge_kinds;
         let mut edges = Vec::new();
         for edge in snapshot.graph.edges.values() {
-            if !edge_kinds.contains(&edge.kind) {
+            if edge.kind != EdgeKind::DependsOn {
+                continue;
+            }
+            if !lens.edge_kinds.contains(&edge.kind) {
                 continue;
             }
             let Some(from_node) = nodes.iter().find(|node| node.id == edge.from) else {
@@ -209,54 +208,17 @@ fn collect_panel_rows(
     }
 }
 
-fn collect_canvas_nodes(
-    node_id: NodeId,
-    depth: u32,
-    graph: &SemanticGraph,
-    intents: &IntentIndex,
-    lens: &Lens,
-    out: &mut Vec<(NodeId, Node, Option<SharedString>)>,
-) {
-    if let Some(max_depth) = lens.max_depth {
-        if depth > max_depth {
-            return;
-        }
-    }
-    let Some(node) = graph.nodes.get(&node_id) else {
-        return;
-    };
-    if !node_passes_lens(node, lens) {
-        return;
-    }
-
-    if matches!(node.kind, NodeKind::Module | NodeKind::Subsystem) {
-        out.push((
-            node_id,
-            node.clone(),
-            intent_summary(intents, node_id),
-        ));
-    }
-
-    if let Some(max_depth) = lens.max_depth {
-        if depth == max_depth {
-            return;
-        }
-    }
-
-    for child_id in sorted_children(graph, node_id) {
-        collect_canvas_nodes(child_id, depth + 1, graph, intents, lens, out);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
     use semantic_graph::{
-        Edge, EcosystemKind, ExternalPayload, GraphPatch, GraphRevision, GraphStatus, Node,
-        NodeFlags, NodeId, NodeKey, NodeKind, NodePayload, SemanticGraph, SubsystemPayload,
+        Edge, EcosystemKind, ExternalPayload, GraphPatch, GraphRevision, GraphStatus, ModuleKind,
+        ModulePayload, ModuleRef, Node, NodeFlags, NodeId, NodeKey, NodeKind, NodePayload,
+        SemanticGraph, SubsystemPayload,
     };
+    use util::rel_path::RelPath;
     use worktree::WorktreeId;
 
     use super::*;
@@ -378,5 +340,113 @@ mod tests {
         );
         assert!(!canvas.nodes.iter().any(|node| node.id == external_id));
         assert!(canvas.edges.is_empty());
+    }
+
+    fn module_node(worktree_id: WorktreeId, name: &str) -> Node {
+        let key = NodeKey::Module {
+            worktree_id,
+            module_ref: ModuleRef::CargoPackage {
+                package_name: name.into(),
+                manifest_dir: Arc::from(
+                    RelPath::from_unix_str(&format!("crates/{name}")).expect("valid path"),
+                ),
+            },
+        };
+        let id = NodeId::from_key(&key);
+        Node::module(
+            id,
+            key,
+            name,
+            None,
+            ModulePayload {
+                language: Some("rust".into()),
+                module_kind: ModuleKind::CrateLib,
+                public_exports: Vec::new(),
+                deps_out_count: 0,
+                deps_in_count: 0,
+                loc_estimate: None,
+            },
+            NodeFlags::default(),
+        )
+    }
+
+    #[test]
+    fn canvas_omits_nested_modules_not_positioned_by_layout() {
+        // hierarchy::layout only places project→subsystem→module (and project→module
+        // orphans). A module nested under another module is reachable by DFS but has
+        // no layout position — the canvas must omit it by design, not silently drop
+        // after collecting it.
+        let worktree_id = WorktreeId::from_usize(1);
+        let project_key = NodeKey::Project { worktree_id };
+        let project_id = NodeId::from_key(&project_key);
+
+        let subsystem_key = NodeKey::Subsystem {
+            project: project_key.clone().into(),
+            slug: "core".into(),
+        };
+        let subsystem_id = NodeId::from_key(&subsystem_key);
+        let subsystem = Node::subsystem(
+            subsystem_id,
+            subsystem_key,
+            "core",
+            SubsystemPayload {
+                member_count: 1,
+                cluster_score: 1.0,
+                pinned: false,
+            },
+            NodeFlags::default(),
+        );
+
+        let parent_module = module_node(worktree_id, "parent");
+        let parent_id = parent_module.id;
+        let nested_module = module_node(worktree_id, "nested");
+        let nested_id = nested_module.id;
+
+        let mut graph = SemanticGraph::default();
+        graph
+            .apply_patch(GraphPatch {
+                base: GraphRevision(0),
+                removed_nodes: Vec::new(),
+                removed_edges: Vec::new(),
+                upsert_nodes: vec![
+                    Node::project(project_id, project_key, "demo"),
+                    subsystem,
+                    parent_module,
+                    nested_module,
+                ],
+                upsert_edges: vec![
+                    Edge::contains(project_id, subsystem_id),
+                    Edge::contains(subsystem_id, parent_id),
+                    Edge::contains(parent_id, nested_id),
+                    Edge::depends_on(parent_id, nested_id),
+                ],
+            })
+            .expect("patch applies");
+
+        let snapshot = SemanticGraphSnapshot {
+            revision: graph.revision(),
+            graph: Arc::new(graph),
+            intents: Arc::new(IntentIndex::default()),
+            status: GraphStatus::Idle,
+        };
+
+        let positions = hierarchy::layout(&snapshot.graph, &Lens::default());
+        assert!(positions.contains_key(&subsystem_id));
+        assert!(positions.contains_key(&parent_id));
+        assert!(
+            !positions.contains_key(&nested_id),
+            "layout must not position nested modules"
+        );
+
+        let canvas = CanvasViewModel::from_snapshot(&snapshot, &Lens::default());
+        let canvas_ids: Vec<_> = canvas.nodes.iter().map(|node| node.id).collect();
+        assert_eq!(canvas_ids, vec![subsystem_id, parent_id]);
+        assert!(
+            !canvas.nodes.iter().any(|node| node.id == nested_id),
+            "canvas must not include nested modules that layout does not place"
+        );
+        // DependsOn to an unpositioned nested target is omitted; Contains is never drawn.
+        assert!(canvas.edges.is_empty());
+        assert_eq!(canvas.nodes.len(), positions.len());
     }
 }
