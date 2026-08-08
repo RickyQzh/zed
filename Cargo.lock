@@ -16629,7 +16629,9 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "pretty_assertions",
+ "semantic_graph",
  "settings",
+ "worktree",
 ]
 
 [[package]]
