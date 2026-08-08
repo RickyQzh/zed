@@ -27,6 +27,8 @@ actions!(
         ToggleFocus,
         /// Opens the source location for the selected semantic map node.
         OpenSelectedSource,
+        /// Opens the Semantic Map canvas in the active pane.
+        OpenCanvas,
         /// Rebuilds the semantic graph for the current project.
         Reindex,
     ]
@@ -111,8 +113,27 @@ impl SemanticMapPanel {
         &self.selection
     }
 
+    pub fn project(&self) -> &Entity<Project> {
+        &self.project
+    }
+
     pub fn view_model(&self) -> &PanelViewModel {
         &self.view_model
+    }
+
+    fn open_canvas(&mut self, _: &OpenCanvas, window: &mut Window, cx: &mut Context<Self>) {
+        if !SemanticMapSettings::get_global(cx).enabled {
+            return;
+        }
+        let project = self.project.clone();
+        let selection = self.selection.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::SemanticMapItem::open_in_workspace(
+                    workspace, project, selection, window, cx,
+                );
+            })
+            .log_err();
     }
 
     fn lens_from_settings(settings: &SemanticMapSettings) -> Lens {
@@ -359,6 +380,7 @@ impl Render for SemanticMapPanel {
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(Self::open_selected_source))
+            .on_action(cx.listener(Self::open_canvas))
             .on_action(cx.listener(Self::reindex))
             .when(!enabled, |this| {
                 this.child(
@@ -368,6 +390,22 @@ impl Render for SemanticMapPanel {
                             Label::new("Enable semantic_map in settings to use this panel.")
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
+                        ),
+                )
+            })
+            .when(enabled, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .justify_end()
+                        .child(
+                            Button::new("open-semantic-map-canvas", "Open Canvas")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_canvas(&OpenCanvas, window, cx);
+                                })),
                         ),
                 )
             })
@@ -421,6 +459,14 @@ pub fn register_panel_actions(workspace: &mut Workspace, _: Option<&mut Window>,
         };
         panel.update(cx, |panel, cx| {
             panel.open_selected_source(&OpenSelectedSource, window, cx);
+        });
+    });
+    workspace.register_action(|workspace, _: &OpenCanvas, window, cx| {
+        let Some(panel) = workspace.panel::<SemanticMapPanel>(cx) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            panel.open_canvas(&OpenCanvas, window, cx);
         });
     });
     workspace.register_action(|workspace, _: &Reindex, window, cx| {

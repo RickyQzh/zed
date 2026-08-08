@@ -1,14 +1,11 @@
 use gpui::{point, size, Bounds, Point, SharedString};
 use semantic_graph::{
     EdgeId, EdgeKind, IntentIndex, Lens, Node, NodeId, NodeKind, SemanticGraph,
-    SemanticGraphSnapshot,
+    SemanticGraphSnapshot, hierarchy,
 };
 
-const CELL_WIDTH: f32 = 240.0;
-const CELL_HEIGHT: f32 = 120.0;
 const NODE_WIDTH: f32 = 200.0;
 const NODE_HEIGHT: f32 = 80.0;
-const GRID_COLUMNS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanelRow {
@@ -81,15 +78,17 @@ impl CanvasViewModel {
             &mut canvas_nodes,
         );
 
+        let positions = hierarchy::layout(&snapshot.graph, lens);
         let mut nodes = Vec::with_capacity(canvas_nodes.len());
-        for (index, (node_id, node, subtitle)) in canvas_nodes.into_iter().enumerate() {
-            let column = (index % GRID_COLUMNS) as f32;
-            let row = (index / GRID_COLUMNS) as f32;
+        for (node_id, node, subtitle) in canvas_nodes {
+            let Some(&(x, y)) = positions.get(&node_id) else {
+                continue;
+            };
             nodes.push(SceneNode {
                 id: node_id,
                 kind: node.kind,
                 rect: Bounds {
-                    origin: point(column * CELL_WIDTH, row * CELL_HEIGHT),
+                    origin: point(x, y),
                     size: size(NODE_WIDTH, NODE_HEIGHT),
                 },
                 title: node.display_name.clone(),
@@ -97,22 +96,32 @@ impl CanvasViewModel {
             });
         }
 
-        let visible: Vec<NodeId> = nodes.iter().map(|node| node.id).collect();
         let edge_kinds = &lens.edge_kinds;
         let mut edges = Vec::new();
         for edge in snapshot.graph.edges.values() {
             if !edge_kinds.contains(&edge.kind) {
                 continue;
             }
-            if !visible.contains(&edge.from) || !visible.contains(&edge.to) {
+            let Some(from_node) = nodes.iter().find(|node| node.id == edge.from) else {
                 continue;
-            }
+            };
+            let Some(to_node) = nodes.iter().find(|node| node.id == edge.to) else {
+                continue;
+            };
+            let from_center = point(
+                from_node.rect.origin.x + from_node.rect.size.width / 2.0,
+                from_node.rect.origin.y + from_node.rect.size.height / 2.0,
+            );
+            let to_center = point(
+                to_node.rect.origin.x + to_node.rect.size.width / 2.0,
+                to_node.rect.origin.y + to_node.rect.size.height / 2.0,
+            );
             edges.push(SceneEdge {
                 id: edge.id,
                 from: edge.from,
                 to: edge.to,
                 kind: edge.kind,
-                routed_path: Vec::new(),
+                routed_path: vec![from_center, to_center],
             });
         }
         edges.sort_by_key(|edge| (edge.from, edge.to, edge.kind as u8));
