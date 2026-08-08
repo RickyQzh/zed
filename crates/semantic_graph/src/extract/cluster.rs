@@ -28,9 +28,9 @@ impl Default for ClusterConfig {
 /// User / repo pins from `semantic_map.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PinConfig {
-    /// Subsystem slug → member path prefixes (e.g. `crates/app`).
+    /// Subsystem slug → exact member module paths (e.g. `crates/app`).
     pub subsystems: Vec<PinnedSubsystem>,
-    /// Module path → forced subsystem slug.
+    /// Exact module path → forced subsystem slug.
     pub module_pins: Vec<ModulePin>,
 }
 
@@ -310,16 +310,17 @@ fn seed_prefix(path: &str) -> String {
 fn agglomerate(clusters: &mut Vec<Cluster>, graph: &SemanticGraph, config: ClusterConfig) {
     let max = config.max_subsystems.max(1);
     let min = config.min_subsystems.min(max).max(1);
+    let mut merge_counter = 0usize;
 
     while clusters.len() > max {
-        if !merge_best_pair(clusters, graph, false) {
-            merge_best_pair(clusters, graph, true);
+        if !merge_best_pair(clusters, graph, false, &mut merge_counter) {
+            merge_best_pair(clusters, graph, true, &mut merge_counter);
         }
     }
 
     // Continue merging while above min and a positive-affinity pair exists.
     while clusters.len() > min {
-        if !merge_best_pair(clusters, graph, false) {
+        if !merge_best_pair(clusters, graph, false, &mut merge_counter) {
             break;
         }
     }
@@ -328,7 +329,12 @@ fn agglomerate(clusters: &mut Vec<Cluster>, graph: &SemanticGraph, config: Clust
     clusters.retain(|cluster| !cluster.members.is_empty());
 }
 
-fn merge_best_pair(clusters: &mut Vec<Cluster>, graph: &SemanticGraph, allow_zero: bool) -> bool {
+fn merge_best_pair(
+    clusters: &mut Vec<Cluster>,
+    graph: &SemanticGraph,
+    allow_zero: bool,
+    merge_counter: &mut usize,
+) -> bool {
     if clusters.len() < 2 {
         return false;
     }
@@ -360,29 +366,34 @@ fn merge_best_pair(clusters: &mut Vec<Cluster>, graph: &SemanticGraph, allow_zer
     };
 
     let right_cluster = clusters.remove(right);
-    let member_count_hint = clusters.len();
     let left_cluster = &mut clusters[left];
     left_cluster.members.extend(right_cluster.members);
-    left_cluster.slug = merged_slug(
-        &left_cluster.slug.clone(),
-        &right_cluster.slug,
-        member_count_hint,
-    );
+    left_cluster.slug = merged_slug(&left_cluster.slug.clone(), &right_cluster.slug, merge_counter);
     true
 }
 
-fn merged_slug(left: &str, right: &str, index_hint: usize) -> String {
+fn merged_slug(left: &str, right: &str, merge_counter: &mut usize) -> String {
     if left == right {
         return left.to_string();
     }
-    let left_parts: Vec<_> = left.split(|c| c == '-' || c == '_').collect();
-    let right_parts: Vec<_> = right.split(|c| c == '-' || c == '_').collect();
-    if let (Some(a), Some(b)) = (left_parts.first(), right_parts.first()) {
-        if a == b && !a.is_empty() {
-            return (*a).to_string();
+    // Synthetic names use `subsystem-{n}`; never collapse those on the shared
+    // "subsystem" token (e.g. subsystem-19 + subsystem-18 must not become "subsystem").
+    if !is_synthetic_subsystem_slug(left) && !is_synthetic_subsystem_slug(right) {
+        let left_parts: Vec<_> = left.split(|c| c == '-' || c == '_').collect();
+        let right_parts: Vec<_> = right.split(|c| c == '-' || c == '_').collect();
+        if let (Some(a), Some(b)) = (left_parts.first(), right_parts.first()) {
+            if a == b && !a.is_empty() && *a != "subsystem" {
+                return (*a).to_string();
+            }
         }
     }
-    format!("subsystem-{index_hint}")
+    *merge_counter += 1;
+    format!("subsystem-{merge_counter}")
+}
+
+fn is_synthetic_subsystem_slug(slug: &str) -> bool {
+    slug.strip_prefix("subsystem-")
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn cluster_pair_affinity(graph: &SemanticGraph, left: &Cluster, right: &Cluster) -> f32 {
@@ -483,7 +494,7 @@ mod tests {
     use worktree::WorktreeId;
 
     use super::{
-        cluster_subsystems, load_pin_config, ClusterConfig, PinConfig, PinnedSubsystem,
+        cluster_subsystems, load_pin_config, merged_slug, ClusterConfig, PinConfig, PinnedSubsystem,
     };
     use crate::{
         Edge, EdgeKind, GraphPatch, ModuleKind, ModulePayload, ModuleRef, Node, NodeFlags, NodeId,
@@ -592,5 +603,22 @@ subsystem = "agent"
         assert_eq!(pins.module_pins.len(), 1);
         assert_eq!(pins.module_pins[0].path, "crates/sandbox");
         assert_eq!(pins.module_pins[0].subsystem, "agent");
+    }
+
+    #[test]
+    fn merged_slug_does_not_collapse_synthetic_subsystem_names() {
+        let mut counter = 0usize;
+        let merged = merged_slug("subsystem-19", "subsystem-18", &mut counter);
+        assert_ne!(merged, "subsystem");
+        assert!(
+            merged.starts_with("subsystem-"),
+            "expected synthetic slug, got {merged}"
+        );
+        assert_eq!(counter, 1);
+
+        // Non-synthetic shared prefixes still collapse to the common token.
+        let shared = merged_slug("editor-core", "editor-ui", &mut counter);
+        assert_eq!(shared, "editor");
+        assert_eq!(counter, 1);
     }
 }

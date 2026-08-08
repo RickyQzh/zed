@@ -65,14 +65,15 @@ pub fn extract_rust_modules_with_base(
         }
 
         if is_dir {
-            let entries = match std::fs::read_dir(&abs_path) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            let mut children: Vec<_> = entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .collect();
+            let entries = std::fs::read_dir(&abs_path)
+                .with_context(|| format!("failed to read directory {}", abs_path.display()))?;
+            let mut children: Vec<PathBuf> = Vec::new();
+            for entry in entries {
+                let entry = entry.with_context(|| {
+                    format!("failed to read entry under {}", abs_path.display())
+                })?;
+                children.push(entry.path());
+            }
             children.sort();
 
             for child in children {
@@ -92,7 +93,7 @@ pub fn extract_rust_modules_with_base(
                         worktree_id,
                         &module_rel,
                         &file_name,
-                        ModuleKind::FileModule,
+                        ModuleKind::Folder,
                     )?;
                     let node_id = node.id;
                     upsert_nodes.push(node);
@@ -299,6 +300,30 @@ mod tests {
         assert!(names.iter().any(|name| name == "util"), "{names:?}");
         assert!(names.iter().any(|name| name == "helper"), "{names:?}");
         assert!(names.iter().any(|name| name == "inner"), "{names:?}");
+
+        let helper = graph
+            .nodes
+            .values()
+            .find(|node| node.display_name.as_ref() == "helper")
+            .expect("helper module");
+        match &helper.payload {
+            crate::NodePayload::Module(payload) => {
+                assert_eq!(payload.module_kind, ModuleKind::Folder);
+            }
+            other => panic!("expected Module payload, got {other:?}"),
+        }
+
+        let util = graph
+            .nodes
+            .values()
+            .find(|node| node.display_name.as_ref() == "util")
+            .expect("util module");
+        match &util.payload {
+            crate::NodePayload::Module(payload) => {
+                assert_eq!(payload.module_kind, ModuleKind::FileModule);
+            }
+            other => panic!("expected Module payload, got {other:?}"),
+        }
 
         let children = graph.children.get(&package_id).cloned().unwrap_or_default();
         assert!(children.len() >= 2);
