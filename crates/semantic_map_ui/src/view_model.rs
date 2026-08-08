@@ -19,6 +19,45 @@ pub struct PanelRow {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PanelViewModel {
     pub rows: Vec<PanelRow>,
+    pub status: PanelStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum PanelStatus {
+    #[default]
+    Ready,
+    Indexing,
+    Partial {
+        reason: SharedString,
+    },
+    Error {
+        message: SharedString,
+    },
+}
+
+impl PanelStatus {
+    pub fn from_graph_status(status: &semantic_graph::GraphStatus) -> Self {
+        use semantic_graph::GraphStatus;
+        match status {
+            GraphStatus::Idle => Self::Ready,
+            GraphStatus::Indexing => Self::Indexing,
+            GraphStatus::Partial { reason } => Self::Partial {
+                reason: reason.clone(),
+            },
+            GraphStatus::Error { message } => Self::Error {
+                message: message.clone(),
+            },
+        }
+    }
+
+    pub fn chip_label(&self) -> SharedString {
+        match self {
+            Self::Ready => "Ready".into(),
+            Self::Indexing => "Indexing…".into(),
+            Self::Partial { .. } => "Partial".into(),
+            Self::Error { .. } => "Error".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,8 +87,9 @@ pub struct CanvasViewModel {
 impl PanelViewModel {
     pub fn from_snapshot(snapshot: &SemanticGraphSnapshot, lens: &Lens) -> Self {
         let mut rows = Vec::new();
+        let status = PanelStatus::from_graph_status(&snapshot.status);
         let Some(root_id) = resolve_root(&snapshot.graph, lens) else {
-            return Self { rows };
+            return Self { rows, status };
         };
         collect_panel_rows(
             root_id,
@@ -59,7 +99,7 @@ impl PanelViewModel {
             lens,
             &mut rows,
         );
-        Self { rows }
+        Self { rows, status }
     }
 }
 

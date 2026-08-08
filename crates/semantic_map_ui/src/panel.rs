@@ -9,7 +9,7 @@ use gpui::{
 use project::{Project, ProjectPath};
 use semantic_graph::{Lens, NodeId, SemanticGraphEvent, SourceLocation};
 use settings::{Settings, SettingsStore};
-use ui::{Color, Label, LabelSize, ListItem, prelude::*};
+use ui::{Chip, Color, Label, LabelSize, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
@@ -17,7 +17,7 @@ use workspace::{
 };
 
 use crate::{
-    PanelRow, PanelViewModel, SemanticMapSelection, SemanticMapSettings,
+    PanelRow, PanelStatus, PanelViewModel, SemanticMapSelection, SemanticMapSettings,
 };
 
 actions!(
@@ -82,6 +82,10 @@ impl SemanticMapPanel {
                     }
                 },
             ));
+            // Status moves to Indexing/Error via notify without always emitting Updated.
+            subscriptions.push(cx.observe(&semantic_graph, |this, _, cx| {
+                this.refresh_view_model(cx);
+            }));
             subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
                 this.refresh_view_model(cx);
                 cx.notify();
@@ -160,8 +164,9 @@ impl SemanticMapPanel {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
         }
+        let max_auto_nodes = SemanticMapSettings::get_global(cx).max_auto_nodes;
         self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(cx);
+            project.reindex_semantic_graph(max_auto_nodes, cx);
         });
         self.has_reindexed = true;
     }
@@ -198,8 +203,9 @@ impl SemanticMapPanel {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
         }
+        let max_auto_nodes = SemanticMapSettings::get_global(cx).max_auto_nodes;
         self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(cx);
+            project.reindex_semantic_graph(max_auto_nodes, cx);
         });
         self.has_reindexed = true;
     }
@@ -260,6 +266,26 @@ fn truncate_intent(summary: &SharedString) -> SharedString {
         format!("{truncated}…").into()
     } else {
         truncated.into()
+    }
+}
+
+fn status_chip(status: &PanelStatus) -> Chip {
+    let label = status.chip_label();
+    let label_color = match status {
+        PanelStatus::Ready => Color::Created,
+        PanelStatus::Indexing => Color::Accent,
+        PanelStatus::Partial { .. } => Color::Warning,
+        PanelStatus::Error { .. } => Color::Error,
+    };
+    let tooltip_text = match status {
+        PanelStatus::Partial { reason } => Some(reason.clone()),
+        PanelStatus::Error { message } => Some(message.clone()),
+        PanelStatus::Ready | PanelStatus::Indexing => None,
+    };
+    let chip = Chip::new(label).label_color(label_color);
+    match tooltip_text {
+        Some(text) => chip.tooltip(Tooltip::text(text)),
+        None => chip,
     }
 }
 
@@ -394,18 +420,33 @@ impl Render for SemanticMapPanel {
                 )
             })
             .when(enabled, |this| {
+                let status = &self.view_model.status;
+                let chip = status_chip(status);
                 this.child(
                     h_flex()
                         .w_full()
                         .px_2()
                         .py_1()
-                        .justify_end()
+                        .gap_2()
+                        .justify_between()
+                        .child(chip)
                         .child(
-                            Button::new("open-semantic-map-canvas", "Open Canvas")
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_canvas(&OpenCanvas, window, cx);
-                                })),
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("semantic-map-reindex", "Reindex")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.reindex(&Reindex, window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("open-semantic-map-canvas", "Open Canvas")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_canvas(&OpenCanvas, window, cx);
+                                        })),
+                                ),
                         ),
                 )
             })
@@ -568,7 +609,20 @@ mod tests {
             });
         });
 
-        // Enable the feature for this test so the panel is active.
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+
+        // Create while disabled so ensure_indexed does not clear the stub via reindex.
+        let panel = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    SemanticMapPanel::new(workspace, window, cx)
+                })
+            })
+            .unwrap();
+
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
@@ -580,25 +634,13 @@ mod tests {
             });
         });
 
-        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = window
-            .read_with(cx, |mw, _| mw.workspace().clone())
-            .unwrap();
-
-        let panel = window
-            .update(cx, |_, window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    SemanticMapPanel::new(workspace, window, cx)
-                })
-            })
-            .unwrap();
-
         panel.read_with(cx, |panel, _| {
             let ids: Vec<_> = panel.view_model().rows.iter().map(|row| row.node_id).collect();
             assert_eq!(ids, vec![project_id, subsystem_id]);
             assert_eq!(panel.view_model().rows[0].kind, NodeKind::Project);
             assert_eq!(panel.view_model().rows[1].kind, NodeKind::Subsystem);
             assert_eq!(panel.view_model().rows[1].depth, 1);
+            assert_eq!(panel.view_model().status, PanelStatus::Ready);
         });
     }
 

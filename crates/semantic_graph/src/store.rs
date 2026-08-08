@@ -80,30 +80,59 @@ impl SemanticGraphStore {
         intents: IntentIndex,
         cx: &mut Context<Self>,
     ) {
+        self.replace_graph_with_status(graph, intents, GraphStatus::Idle, cx);
+    }
+
+    pub fn replace_graph_with_status(
+        &mut self,
+        graph: SemanticGraph,
+        intents: IntentIndex,
+        status: GraphStatus,
+        cx: &mut Context<Self>,
+    ) {
         self.graph = graph;
         self.intents = intents;
-        self.status = GraphStatus::Idle;
+        self.status = status;
         let revision = self.graph.revision();
         cx.emit(SemanticGraphEvent::Updated { revision });
         cx.notify();
     }
 
-    /// Build the graph for `root` on a background thread, then apply on the foreground.
+    /// Clear the current graph and rebuild for `root` on a background thread.
+    ///
+    /// When the built graph would exceed `max_auto_nodes`, nodes are truncated and
+    /// status becomes [`GraphStatus::Partial`].
     pub fn reindex(
         &mut self,
         root: Arc<Path>,
         worktree_id: WorktreeId,
+        max_auto_nodes: usize,
         cx: &mut Context<Self>,
     ) {
+        self.graph = SemanticGraph::default();
+        self.intents = IntentIndex::default();
         self.status = GraphStatus::Indexing;
+        let revision = self.graph.revision();
+        cx.emit(SemanticGraphEvent::Updated { revision });
         cx.notify();
 
-        let build = cx.background_spawn(async move { build_initial_graph(&root, worktree_id) });
+        let build = cx.background_spawn(async move {
+            build_initial_graph(&root, worktree_id, max_auto_nodes)
+        });
         self.reindex_task = Some(cx.spawn(async move |this, cx| {
             let result = build.await;
             match this.update(cx, |this, cx| match result {
-                Ok((graph, intents)) => {
-                    this.replace_graph(graph, intents, cx);
+                Ok((graph, intents, truncated)) => {
+                    let status = if truncated {
+                        GraphStatus::Partial {
+                            reason: SharedString::from(format!(
+                                "Graph truncated to {max_auto_nodes} nodes (max_auto_nodes)"
+                            )),
+                        }
+                    } else {
+                        GraphStatus::Idle
+                    };
+                    this.replace_graph_with_status(graph, intents, status, cx);
                 }
                 Err(error) => {
                     this.status = GraphStatus::Error {
@@ -383,7 +412,7 @@ mod tests {
         let store = cx.new(|cx| SemanticGraphStore::new(cx));
 
         store.update(cx, |store, cx| {
-            store.reindex(root.clone(), worktree_id, cx);
+            store.reindex(root.clone(), worktree_id, usize::MAX, cx);
         });
 
         let status = store.read_with(cx, |store, _| store.status().clone());
@@ -400,5 +429,45 @@ mod tests {
             "expected cargo fixture modules after reindex"
         );
         assert!(!snap.intents.is_empty());
+    }
+
+    #[gpui::test]
+    async fn reindex_sets_partial_when_over_max_auto_nodes(cx: &mut TestAppContext) {
+        let root = Arc::<Path>::from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("test_data/simple_workspace")
+                .into_boxed_path(),
+        );
+        let worktree_id = WorktreeId::from_usize(1);
+        let store = cx.new(|cx| SemanticGraphStore::new(cx));
+
+        // Fixture has multiple modules/nodes; a tiny budget must truncate.
+        let max_auto_nodes = 2;
+        store.update(cx, |store, cx| {
+            store.reindex(root.clone(), worktree_id, max_auto_nodes, cx);
+        });
+        cx.run_until_parked();
+
+        let snap = store.read_with(cx, |store, _| store.snapshot());
+        assert!(
+            matches!(snap.status, GraphStatus::Partial { .. }),
+            "expected Partial when modules exceed max_auto_nodes, got {:?}",
+            snap.status
+        );
+        assert!(
+            snap.graph.nodes.len() <= max_auto_nodes,
+            "graph must respect max_auto_nodes budget, got {} nodes",
+            snap.graph.nodes.len()
+        );
+        let module_count = snap
+            .graph
+            .nodes
+            .values()
+            .filter(|node| node.kind == NodeKind::Module)
+            .count();
+        assert!(
+            module_count <= max_auto_nodes,
+            "module count must not exceed budget"
+        );
     }
 }
