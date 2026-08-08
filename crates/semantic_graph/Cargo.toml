@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
+globset.workspace = true
 gpui.workspace = true
 parking_lot.workspace = true
 serde.workspace = true

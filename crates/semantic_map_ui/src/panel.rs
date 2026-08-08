@@ -68,7 +68,7 @@ impl SemanticMapPanel {
         let project = workspace.project().clone();
         let workspace_handle = workspace.weak_handle();
 
-        cx.new(|cx| {
+        let panel = cx.new(|cx| {
             let selection = cx.new(|_cx| SemanticMapSelection::new());
             let focus_handle = cx.focus_handle();
             let semantic_graph = project.read(cx).semantic_graph().clone();
@@ -108,9 +108,17 @@ impl SemanticMapPanel {
                 this.ensure_indexed(cx);
             }
 
-            let _ = window;
             this
-        })
+        });
+
+        let settings = SemanticMapSettings::get_global(cx);
+        if settings.enabled && settings.auto_open_canvas_on_project_open {
+            panel.update(cx, |panel, cx| {
+                panel.open_canvas(&OpenCanvas, window, cx);
+            });
+        }
+
+        panel
     }
 
     pub fn selection(&self) -> &Entity<SemanticMapSelection> {
@@ -164,13 +172,23 @@ impl SemanticMapPanel {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
         }
-        let settings = SemanticMapSettings::get_global(cx);
-        let max_auto_nodes = settings.max_auto_nodes;
-        let intent_llm = settings.intent.llm;
+        let options = Self::build_options_from_settings(SemanticMapSettings::get_global(cx));
         self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(max_auto_nodes, intent_llm, cx);
+            project.reindex_semantic_graph(options, cx);
         });
         self.has_reindexed = true;
+    }
+
+    fn build_options_from_settings(settings: &SemanticMapSettings) -> semantic_graph::BuildGraphOptions {
+        semantic_graph::BuildGraphOptions {
+            max_auto_nodes: settings.max_auto_nodes,
+            module_depth: settings.module_depth as u32,
+            cluster: semantic_graph::ClusterConfig {
+                min_subsystems: settings.cluster.min_subsystems,
+                max_subsystems: settings.cluster.max_subsystems,
+            },
+            intent_llm: settings.intent.llm,
+        }
     }
 
     fn select_node(&mut self, node_id: NodeId, cx: &mut Context<Self>) {
@@ -205,11 +223,9 @@ impl SemanticMapPanel {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
         }
-        let settings = SemanticMapSettings::get_global(cx);
-        let max_auto_nodes = settings.max_auto_nodes;
-        let intent_llm = settings.intent.llm;
+        let options = Self::build_options_from_settings(SemanticMapSettings::get_global(cx));
         self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(max_auto_nodes, intent_llm, cx);
+            project.reindex_semantic_graph(options, cx);
         });
         self.has_reindexed = true;
     }

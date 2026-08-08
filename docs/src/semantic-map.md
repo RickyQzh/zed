@@ -52,11 +52,11 @@ partial (truncated by budget), or in error. Use **Reindex**
 Open the spatial canvas with {#action semantic_map::OpenCanvas}, or click
 **Open Canvas** in the panel.
 
-The canvas lays out nodes as cards with dependency edges. Pan and zoom to
-explore. Select a card to sync selection with the panel. The canvas does not
-open files on double-click—select a card, then use
-{#action semantic_map::OpenSelectedSource} or open the node from the panel
-when a location is available.
+The canvas lays out nodes as cards with dependency edges. Pan to explore
+(Phase A has no zoom controls). Select a card to sync selection with the
+panel. The canvas does not open files on double-click—select a card, then
+use {#action semantic_map::OpenSelectedSource} or open the node from the
+panel when a location is available.
 
 To open the canvas automatically when a project opens:
 
@@ -93,7 +93,15 @@ summary = "GPU UI framework and shared widgets"
 members = ["crates/editor", "crates/multi_buffer", "crates/language"]
 ```
 
-Repo config overrides clustering heuristics on the next index.
+Repo config overrides clustering heuristics on the next index. When a
+subsystem pin includes a `summary`, that text becomes the subsystem's
+static intent on the map.
+
+## Phase A limitations {#phase-a-limitations}
+
+- Canvas navigation is pan-only (no wheel/UI zoom yet).
+- Cargo `workspace.members` globs such as `crates/*` are expanded; exclude
+  lists and full Cargo glob parity are not guaranteed.
 
 ## Privacy and intent {#privacy}
 
@@ -123,16 +131,18 @@ repository by default.
 
 ## Settings reference {#settings-reference}
 
-| Setting                                         | Default | Purpose                                     |
-| ----------------------------------------------- | ------- | ------------------------------------------- |
-| `semantic_map.enabled`                          | `false` | Master gate for panel and canvas            |
-| `semantic_map.auto_open_canvas_on_project_open` | `false` | Open canvas when a project opens            |
-| `semantic_map.hide_external`                    | `true`  | Hide external dependency nodes              |
-| `semantic_map.hide_tests`                       | `true`  | Hide test-only modules and crates           |
-| `semantic_map.module_depth`                     | `3`     | How deep to expand modules automatically    |
-| `semantic_map.max_auto_nodes`                   | `500`   | Soft cap before the graph is marked partial |
-| `semantic_map.intent.llm`                       | `false` | Opt into LLM intent enrichment              |
-| `semantic_map.intent.llm_on_visible_only`       | `true`  | Limit LLM requests to visible nodes         |
+| Setting                                         | Default | Purpose                                      |
+| ----------------------------------------------- | ------- | -------------------------------------------- |
+| `semantic_map.enabled`                          | `false` | Master gate for panel and canvas             |
+| `semantic_map.auto_open_canvas_on_project_open` | `false` | Open canvas when a project opens             |
+| `semantic_map.hide_external`                    | `true`  | Hide external dependency nodes               |
+| `semantic_map.hide_tests`                       | `true`  | Hide test-only modules and crates            |
+| `semantic_map.module_depth`                     | `3`     | How deep to expand modules automatically     |
+| `semantic_map.max_auto_nodes`                   | `500`   | Soft cap before the graph is marked partial  |
+| `semantic_map.cluster.min_subsystems`           | `3`     | Soft minimum subsystem count when clustering |
+| `semantic_map.cluster.max_subsystems`           | `16`    | Soft maximum subsystem count when clustering |
+| `semantic_map.intent.llm`                       | `false` | Opt into LLM intent enrichment               |
+| `semantic_map.intent.llm_on_visible_only`       | `true`  | Limit LLM requests to visible nodes          |
 
 ## See Also {#see-also}
 

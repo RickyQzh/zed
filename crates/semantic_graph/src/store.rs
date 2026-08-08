@@ -8,8 +8,8 @@ use util::rel_path::RelPath;
 use worktree::WorktreeId;
 
 use crate::{
-    build_initial_graph, GraphPatch, GraphRevision, Intent, ModuleRef, NodeId, NodeKey,
-    SemanticGraph, SourceLocation,
+    build_initial_graph, BuildGraphOptions, GraphPatch, GraphRevision, Intent, ModuleRef, NodeId,
+    NodeKey, SemanticGraph, SourceLocation,
 };
 
 /// Map from node id → intent text for that node.
@@ -100,17 +100,16 @@ impl SemanticGraphStore {
 
     /// Clear the current graph and rebuild for `root` on a background thread.
     ///
-    /// When the built graph would exceed `max_auto_nodes`, nodes are truncated and
+    /// When the built graph would exceed `options.max_auto_nodes`, nodes are truncated and
     /// status becomes [`GraphStatus::Partial`].
     ///
-    /// `intent_llm` gates optional LLM intent enrichment (stub); false keeps the
+    /// `options.intent_llm` gates optional LLM intent enrichment (stub); false keeps the
     /// offline static-intent path and does not require a model service.
     pub fn reindex(
         &mut self,
         root: Arc<Path>,
         worktree_id: WorktreeId,
-        max_auto_nodes: usize,
-        intent_llm: bool,
+        options: BuildGraphOptions,
         cx: &mut Context<Self>,
     ) {
         self.graph = SemanticGraph::default();
@@ -120,8 +119,9 @@ impl SemanticGraphStore {
         cx.emit(SemanticGraphEvent::Updated { revision });
         cx.notify();
 
+        let max_auto_nodes = options.max_auto_nodes;
         let build = cx.background_spawn(async move {
-            build_initial_graph(&root, worktree_id, max_auto_nodes, intent_llm)
+            build_initial_graph(&root, worktree_id, options)
         });
         self.reindex_task = Some(cx.spawn(async move |this, cx| {
             let result = build.await;
@@ -416,7 +416,7 @@ mod tests {
         let store = cx.new(|cx| SemanticGraphStore::new(cx));
 
         store.update(cx, |store, cx| {
-            store.reindex(root.clone(), worktree_id, usize::MAX, false, cx);
+            store.reindex(root.clone(), worktree_id, BuildGraphOptions::default(), cx);
         });
 
         let status = store.read_with(cx, |store, _| store.status().clone());
@@ -448,7 +448,15 @@ mod tests {
         // Fixture has multiple modules/nodes; a tiny budget must truncate.
         let max_auto_nodes = 2;
         store.update(cx, |store, cx| {
-            store.reindex(root.clone(), worktree_id, max_auto_nodes, false, cx);
+            store.reindex(
+                root.clone(),
+                worktree_id,
+                BuildGraphOptions {
+                    max_auto_nodes,
+                    ..BuildGraphOptions::default()
+                },
+                cx,
+            );
         });
         cx.run_until_parked();
 

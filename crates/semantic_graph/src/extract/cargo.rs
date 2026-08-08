@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -271,17 +271,16 @@ fn workspace_member_dirs(root: &Path, root_toml: &toml::Value) -> Result<Vec<Pat
         .and_then(|members| members.as_array())
     {
         let mut dirs = Vec::new();
+        let mut seen = BTreeSet::new();
         for member in members {
             let Some(pattern) = member.as_str() else {
                 continue;
             };
-            // Literal member paths first; glob patterns deferred.
-            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-                continue;
-            }
-            let dir = root.join(pattern);
-            if dir.join("Cargo.toml").is_file() {
-                dirs.push(dir);
+            for dir in expand_member_pattern(root, pattern)? {
+                let key = canonicalize_or_normalize(&dir);
+                if seen.insert(key) {
+                    dirs.push(dir);
+                }
             }
         }
         return Ok(dirs);
@@ -296,6 +295,73 @@ fn workspace_member_dirs(root: &Path, root_toml: &toml::Value) -> Result<Vec<Pat
         "no workspace members or package found in {}",
         root.join("Cargo.toml").display()
     )
+}
+
+fn expand_member_pattern(root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    if !is_glob_pattern(pattern) {
+        let dir = root.join(pattern);
+        if dir.join("Cargo.toml").is_file() {
+            return Ok(vec![dir]);
+        }
+        return Ok(Vec::new());
+    }
+
+    let glob = globset::Glob::new(pattern)
+        .with_context(|| format!("invalid workspace member glob `{pattern}`"))?;
+    let matcher = glob.compile_matcher();
+    let mut matches = Vec::new();
+    collect_glob_member_dirs(root, root, &matcher, 0, &mut matches)?;
+    matches.sort();
+    Ok(matches)
+}
+
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+fn collect_glob_member_dirs(
+    workspace_root: &Path,
+    dir: &Path,
+    matcher: &globset::GlobMatcher,
+    depth: u32,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    // Bound walk depth; Cargo member globs are typically shallow (`crates/*`).
+    if depth > 8 {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to read entry under {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".git" || name == "target" || name == "node_modules" {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(workspace_root) else {
+            continue;
+        };
+        let relative_unix = relative.to_string_lossy().replace('\\', "/");
+        if matcher.is_match(&relative_unix) && path.join("Cargo.toml").is_file() {
+            out.push(path.clone());
+            // Matched package roots are leaves for member expansion.
+            continue;
+        }
+        collect_glob_member_dirs(workspace_root, &path, matcher, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+fn canonicalize_or_normalize(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| normalize_path(path))
 }
 
 fn load_packages(root: &Path, member_dirs: &[PathBuf]) -> Result<Vec<PackageInfo>> {
@@ -497,6 +563,65 @@ mod tests {
                 .values()
                 .any(|e| e.kind == EdgeKind::DependsOn),
             "expected DependsOn edge from app to core_lib"
+        );
+    }
+
+    #[test]
+    fn cargo_extractor_expands_glob_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/*"]
+"#,
+        )
+        .unwrap();
+        for name in ["alpha", "beta"] {
+            let crate_dir = root.join("crates").join(name);
+            std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+            std::fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!(
+                    r#"
+[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(crate_dir.join("src/lib.rs"), "// lib\n").unwrap();
+        }
+        // Non-matching sibling should be ignored.
+        let other = root.join("apps").join("gamma");
+        std::fs::create_dir_all(other.join("src")).unwrap();
+        std::fs::write(
+            other.join("Cargo.toml"),
+            r#"
+[package]
+name = "gamma"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(other.join("src/lib.rs"), "// lib\n").unwrap();
+
+        let patch = extract_cargo_workspace(root, WorktreeId::from_usize(1)).unwrap();
+        let mut graph = SemanticGraph::default();
+        graph.apply_patch(patch).unwrap();
+        let names: BTreeSet<_> = graph
+            .nodes
+            .values()
+            .filter(|n| n.kind == NodeKind::Module)
+            .map(|n| n.display_name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["alpha".to_string(), "beta".to_string()])
         );
     }
 }
