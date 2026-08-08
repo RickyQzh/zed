@@ -1,37 +1,62 @@
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use collections::HashSet;
+use collections::{FxHasher, HashSet};
+use gpui::SharedString;
+use util::rel_path::RelPath;
 use worktree::WorktreeId;
 
 use crate::extract::{
     cluster_subsystems, extract_cargo_workspace, extract_generic, extract_rust_modules_with_base,
-    load_pin_config_from_root, ClusterConfig,
+    load_pin_config_from_root, ClusterConfig, PinConfig,
 };
 use crate::intent::{LlmIntentProvider, StaticIntentProvider};
 use crate::{
-    EdgeId, GraphPatch, GraphStatus, IntentIndex, ModuleRef, NodeId, NodeKind, SemanticGraph,
-    SemanticGraphSnapshot,
+    Confidence, ContentHash, EdgeId, Evidence, EvidenceKind, GraphPatch, GraphStatus, Intent,
+    IntentIndex, IntentSource, ModuleRef, NodeId, NodeKind, SemanticGraph, SemanticGraphSnapshot,
+    SourceLocation, Timestamp,
 };
 
-const DEFAULT_MODULE_DEPTH: u32 = 2;
+/// Settings / knobs for [`build_initial_graph`] (and store reindex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildGraphOptions {
+    pub max_auto_nodes: usize,
+    pub module_depth: u32,
+    pub cluster: ClusterConfig,
+    pub intent_llm: bool,
+}
+
+impl Default for BuildGraphOptions {
+    fn default() -> Self {
+        Self {
+            max_auto_nodes: usize::MAX,
+            // Matches `semantic_map.module_depth` default in settings.
+            module_depth: 3,
+            cluster: ClusterConfig::default(),
+            intent_llm: false,
+        }
+    }
+}
 
 /// Sync orchestration: Cargo workspace when present, otherwise generic thin extract,
-/// then rust module depth (Cargo), subsystem clustering, then static intents,
-/// then optional LLM intent enrichment (settings-gated stub).
+/// then rust module depth (Cargo), subsystem clustering, then static intents
+/// (including pin `summary` → Subsystem intents), then optional LLM enrichment
+/// (settings-gated stub).
 ///
 /// When the resulting graph exceeds `max_auto_nodes`, excess nodes are dropped and the
 /// third return value is `true` (caller should surface [`GraphStatus::Partial`]).
 ///
-/// `intent_llm` gates [`LlmIntentProvider`]; when false (default), enrichment is skipped
-/// and no model service is required.
+/// `options.intent_llm` gates [`LlmIntentProvider`]; when false (default), enrichment
+/// is skipped and no model service is required.
 pub fn build_initial_graph(
     root: &Path,
     worktree_id: WorktreeId,
-    max_auto_nodes: usize,
-    intent_llm: bool,
+    options: BuildGraphOptions,
 ) -> Result<(SemanticGraph, IntentIndex, bool)> {
+    let max_auto_nodes = options.max_auto_nodes;
     let mut graph = SemanticGraph::default();
     let mut truncated = false;
     if root.join("Cargo.toml").is_file() {
@@ -42,27 +67,97 @@ pub fn build_initial_graph(
                 &mut graph,
                 root,
                 worktree_id,
-                DEFAULT_MODULE_DEPTH,
+                options.module_depth,
                 max_auto_nodes,
             )?;
         }
     } else {
-        let patch = extract_generic(root, worktree_id, 2)?;
+        let patch = extract_generic(root, worktree_id, options.module_depth)?;
         truncated |= apply_patch_with_budget(&mut graph, patch, max_auto_nodes)?;
     }
 
     // Always cluster (including pin-driven subsystems), then trim so Subsystem
     // nodes outrank Modules/Entries when near the auto-node cap.
     let pins = load_pin_config_from_root(root)?;
-    let patch = cluster_subsystems(&graph, ClusterConfig::default(), &pins)?;
+    let patch = cluster_subsystems(&graph, options.cluster, &pins)?;
     graph.apply_patch(patch)?;
 
     let mut intents = StaticIntentProvider::enrich(&graph, root)?;
-    for intent in LlmIntentProvider.enrich_if_enabled(intent_llm, &graph, &intents) {
+    for intent in intents_from_pin_summaries(&graph, &pins, worktree_id, root)? {
+        intents.insert(intent.subject, intent);
+    }
+    for intent in LlmIntentProvider.enrich_if_enabled(options.intent_llm, &graph, &intents) {
         intents.insert(intent.subject, intent);
     }
     truncated |= enforce_max_auto_nodes(&mut graph, &mut intents, max_auto_nodes)?;
     Ok((graph, intents, truncated))
+}
+
+/// Emit Static Subsystem intents from `semantic_map.toml` pin `summary` fields.
+fn intents_from_pin_summaries(
+    graph: &SemanticGraph,
+    pins: &PinConfig,
+    worktree_id: WorktreeId,
+    _root: &Path,
+) -> Result<Vec<Intent>> {
+    let pin_location = RelPath::from_unix_str("semantic_map.toml")
+        .ok()
+        .map(|path| SourceLocation {
+            worktree_id,
+            path: Arc::from(path),
+            range: None,
+            symbol: None,
+        });
+
+    let mut intents = Vec::new();
+    let updated_at = Timestamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0),
+    );
+
+    for pin in &pins.subsystems {
+        let Some(summary) = pin.summary.as_ref() else {
+            continue;
+        };
+        let summary = summary.trim();
+        if summary.is_empty() {
+            continue;
+        }
+        let Some(subject) = graph.nodes.values().find_map(|node| {
+            (node.kind == NodeKind::Subsystem && node.display_name.as_ref() == pin.slug)
+                .then_some(node.id)
+        }) else {
+            continue;
+        };
+
+        let excerpt = SharedString::from(summary.to_string());
+        let evidence = vec![Evidence {
+            kind: EvidenceKind::ManifestMetadata,
+            location: pin_location.clone(),
+            excerpt: excerpt.clone(),
+            weight: 1.0,
+        }];
+        let content_hash = {
+            let mut hasher = FxHasher::default();
+            EvidenceKind::ManifestMetadata.hash(&mut hasher);
+            excerpt.hash(&mut hasher);
+            ContentHash(hasher.finish())
+        };
+
+        intents.push(Intent {
+            subject,
+            summary: SharedString::from(format!("{}: {summary}", pin.slug)),
+            bullets: Vec::new(),
+            confidence: Confidence::High,
+            source: IntentSource::Static,
+            evidence,
+            updated_at,
+            content_hash,
+        });
+    }
+    Ok(intents)
 }
 
 /// Apply `patch`, then drop overflow nodes so the graph stays within `max_auto_nodes`.
@@ -188,7 +283,7 @@ impl GraphIndexer {
         worktree_id: WorktreeId,
     ) -> Result<SemanticGraphSnapshot> {
         let (graph, intents, truncated) =
-            build_initial_graph(root, worktree_id, usize::MAX, false)?;
+            build_initial_graph(root, worktree_id, BuildGraphOptions::default())?;
         Ok(SemanticGraphSnapshot {
             revision: graph.revision(),
             graph: Arc::new(graph),
@@ -240,15 +335,24 @@ mod tests {
 
     use worktree::WorktreeId;
 
-    use super::{build_initial_graph, GraphIndexer};
+    use super::{build_initial_graph, BuildGraphOptions, GraphIndexer};
     use crate::intent::StaticIntentProvider;
     use crate::{EdgeKind, NodeKind};
+
+    fn build_opts(max_auto_nodes: usize, intent_llm: bool) -> BuildGraphOptions {
+        BuildGraphOptions {
+            max_auto_nodes,
+            intent_llm,
+            ..BuildGraphOptions::default()
+        }
+    }
 
     #[test]
     fn build_initial_graph_cargo_fixture_has_core_lib_intent() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
         let (graph, intents, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), build_opts(usize::MAX, false))
+                .unwrap();
         assert!(!truncated);
         assert!(
             graph.nodes.values().any(|node| {
@@ -275,6 +379,13 @@ mod tests {
             }),
             "expected Contains(ui → app) from semantic_map.toml pins"
         );
+        let ui_intent = intents.get(&ui_id).expect("pin summary should become ui intent");
+        assert!(
+            ui_intent.summary.to_lowercase().contains("application binary"),
+            "expected pin summary in ui intent, got {:?}",
+            ui_intent.summary
+        );
+        assert!(matches!(ui_intent.source, crate::IntentSource::Static));
 
         let snap =
             GraphIndexer::reindex_cargo_or_generic(&root, WorktreeId::from_usize(1)).unwrap();
@@ -286,8 +397,12 @@ mod tests {
     fn build_initial_graph_truncates_when_over_max_auto_nodes() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
         let max_auto_nodes = 2;
-        let (graph, _intents, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes, false).unwrap();
+        let (graph, _intents, truncated) = build_initial_graph(
+            &root,
+            WorktreeId::from_usize(1),
+            build_opts(max_auto_nodes, false),
+        )
+        .unwrap();
         assert!(truncated);
         assert!(graph.nodes.len() <= max_auto_nodes);
     }
@@ -299,7 +414,8 @@ mod tests {
         // Cluster then trim must still surface Subsystem nodes (pins / auto clusters)
         // ahead of dropping Modules.
         let unlimited =
-            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), build_opts(usize::MAX, false))
+                .unwrap();
         let (full_graph, _, _) = unlimited;
         let module_only_count = full_graph
             .nodes
@@ -309,8 +425,12 @@ mod tests {
         // Cap just below the pre-cluster node count so clustering was previously skipped,
         // but large enough that Project + at least one Subsystem can survive the trim.
         let max_auto_nodes = module_only_count.max(2);
-        let (graph, _intents, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes, false).unwrap();
+        let (graph, _intents, truncated) = build_initial_graph(
+            &root,
+            WorktreeId::from_usize(1),
+            build_opts(max_auto_nodes, false),
+        )
+        .unwrap();
         assert!(truncated);
         assert!(graph.nodes.len() <= max_auto_nodes);
         assert!(
@@ -326,7 +446,8 @@ mod tests {
     fn build_with_intent_llm_disabled_keeps_static_intents_offline() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
         let (graph, intents, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), build_opts(usize::MAX, false))
+                .unwrap();
         assert!(!truncated);
         assert!(!intents.is_empty());
         assert!(
@@ -335,16 +456,26 @@ mod tests {
                 .all(|intent| matches!(intent.source, crate::IntentSource::Static)),
             "disabled LLM path must leave static intents untouched without a model"
         );
-        assert_eq!(intents.len(), StaticIntentProvider::enrich(&graph, &root).unwrap().len());
+        let module_intents = StaticIntentProvider::enrich(&graph, &root).unwrap();
+        assert!(
+            intents.len() >= module_intents.len(),
+            "build must include static module intents plus any pin-summary subsystem intents"
+        );
+        for (node_id, intent) in &module_intents {
+            let built = intents.get(node_id).expect("module static intent retained");
+            assert_eq!(built.summary, intent.summary);
+        }
     }
 
     #[test]
     fn build_with_intent_llm_enabled_stub_leaves_static_intents() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
         let (graph, intents_off, _) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), build_opts(usize::MAX, false))
+                .unwrap();
         let (_graph_on, intents_on, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, true).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), build_opts(usize::MAX, true))
+                .unwrap();
         assert!(!truncated);
         // Stub returns no LLM intents; static index must stay intact (no error required).
         assert_eq!(intents_on.len(), intents_off.len());

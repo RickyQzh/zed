@@ -138,7 +138,7 @@
     "hide_tests": true,
     // Whether to open the Semantic Map canvas when a project opens.
     "auto_open_canvas_on_project_open": false,
-    // Maximum module nesting depth to expand automatically.
+    // Maximum module nesting depth to expand automatically during index.
     "module_depth": 3,
     // Soft cap on nodes shown without progressive disclosure.
     "max_auto_nodes": 500,
