@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use collections::HashMap;
-use gpui::{Context, EventEmitter, SharedString, Task};
+use gpui::{AppContext as _, Context, EventEmitter, SharedString, Task};
 use util::rel_path::RelPath;
 use worktree::WorktreeId;
 
