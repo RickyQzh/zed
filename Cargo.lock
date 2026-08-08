@@ -16627,10 +16627,18 @@ dependencies = [
 name = "semantic_map_ui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui",
  "pretty_assertions",
+ "project",
  "semantic_graph",
+ "serde_json",
  "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
  "worktree",
 ]
 
@@ -23424,6 +23432,7 @@ dependencies = [
  "rope",
  "sandbox",
  "search",
+ "semantic_map_ui",
  "semver",
  "serde",
  "serde_json",
