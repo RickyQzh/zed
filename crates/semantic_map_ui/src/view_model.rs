@@ -142,20 +142,8 @@ fn node_passes_lens(node: &Node, lens: &Lens) -> bool {
     if !lens.allowed_kinds.contains(&node.kind) {
         return false;
     }
-    if let Some(focus) = &lens.focus {
-        if !focus.node_ids.is_empty() && !focus.node_ids.contains(&node.id) {
-            return false;
-        }
-        if let Some(text) = &focus.text {
-            let query = text.to_lowercase();
-            if query.is_empty() {
-                return true;
-            }
-            if !node.display_name.to_lowercase().contains(&query) {
-                return false;
-            }
-        }
-    }
+    // Ignore `lens.focus` for now: per-node checks prune ancestors and hide matching
+    // descendants. Proper subtree / ancestor-preserving focus is Task 10+.
     true
 }
 
