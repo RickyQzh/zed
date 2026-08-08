@@ -46,11 +46,11 @@ pub fn build_initial_graph(
         truncated |= apply_patch_with_budget(&mut graph, patch, max_auto_nodes)?;
     }
 
-    if graph.nodes.len() < max_auto_nodes {
-        let pins = load_pin_config_from_root(root)?;
-        let patch = cluster_subsystems(&graph, ClusterConfig::default(), &pins)?;
-        truncated |= apply_patch_with_budget(&mut graph, patch, max_auto_nodes)?;
-    }
+    // Always cluster (including pin-driven subsystems), then trim so Subsystem
+    // nodes outrank Modules/Entries when near the auto-node cap.
+    let pins = load_pin_config_from_root(root)?;
+    let patch = cluster_subsystems(&graph, ClusterConfig::default(), &pins)?;
+    graph.apply_patch(patch)?;
 
     let mut intents = StaticIntentProvider::enrich(&graph, root)?;
     truncated |= enforce_max_auto_nodes(&mut graph, &mut intents, max_auto_nodes)?;
@@ -280,5 +280,35 @@ mod tests {
             build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes).unwrap();
         assert!(truncated);
         assert!(graph.nodes.len() <= max_auto_nodes);
+    }
+
+    #[test]
+    fn build_initial_graph_clusters_before_trim_prefers_subsystems() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
+        // Budget equal to post-extract size would previously skip clustering entirely.
+        // Cluster then trim must still surface Subsystem nodes (pins / auto clusters)
+        // ahead of dropping Modules.
+        let unlimited =
+            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX).unwrap();
+        let (full_graph, _, _) = unlimited;
+        let module_only_count = full_graph
+            .nodes
+            .values()
+            .filter(|node| node.kind != NodeKind::Subsystem)
+            .count();
+        // Cap just below the pre-cluster node count so clustering was previously skipped,
+        // but large enough that Project + at least one Subsystem can survive the trim.
+        let max_auto_nodes = module_only_count.max(2);
+        let (graph, _intents, truncated) =
+            build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes).unwrap();
+        assert!(truncated);
+        assert!(graph.nodes.len() <= max_auto_nodes);
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.kind == NodeKind::Subsystem),
+            "expected clustering to run before trim so Subsystem nodes are retained"
+        );
     }
 }

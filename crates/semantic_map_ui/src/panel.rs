@@ -289,6 +289,11 @@ fn status_chip(status: &PanelStatus) -> Chip {
     }
 }
 
+/// Empty-state copy is only for a Ready panel with no rows — not Indexing/Partial/Error.
+fn shows_empty_nodes_copy(enabled: bool, row_count: usize, status: &PanelStatus) -> bool {
+    enabled && row_count == 0 && matches!(status, PanelStatus::Ready)
+}
+
 fn project_path_from_source_location(location: &SourceLocation) -> ProjectPath {
     ProjectPath {
         worktree_id: location.worktree_id,
@@ -450,17 +455,18 @@ impl Render for SemanticMapPanel {
                         ),
                 )
             })
-            .when(enabled && row_count == 0, |this| {
-                this.child(
-                    div()
-                        .p_3()
-                        .child(
+            .when(
+                shows_empty_nodes_copy(enabled, row_count, &self.view_model.status),
+                |this| {
+                    this.child(
+                        div().p_3().child(
                             Label::new("No semantic map nodes yet. Focus the panel to index.")
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
-                )
-            })
+                    )
+                },
+            )
             .when(enabled, |this| {
                 this.child(
                     uniform_list(
@@ -650,6 +656,28 @@ mod tests {
         let truncated = truncate_intent(&long);
         assert!(truncated.ends_with('…'));
         assert_eq!(truncated.chars().count(), INTENT_TRUNCATE_CHARS + 1);
+    }
+
+    #[test]
+    fn empty_nodes_copy_only_when_ready() {
+        assert!(shows_empty_nodes_copy(true, 0, &PanelStatus::Ready));
+        assert!(!shows_empty_nodes_copy(true, 0, &PanelStatus::Indexing));
+        assert!(!shows_empty_nodes_copy(
+            true,
+            0,
+            &PanelStatus::Partial {
+                reason: "truncated".into(),
+            },
+        ));
+        assert!(!shows_empty_nodes_copy(
+            true,
+            0,
+            &PanelStatus::Error {
+                message: "boom".into(),
+            },
+        ));
+        assert!(!shows_empty_nodes_copy(true, 1, &PanelStatus::Ready));
+        assert!(!shows_empty_nodes_copy(false, 0, &PanelStatus::Ready));
     }
 
     #[test]
