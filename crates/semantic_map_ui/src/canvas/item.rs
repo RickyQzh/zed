@@ -10,11 +10,14 @@ use semantic_graph::{
 };
 use settings::{Settings, SettingsStore};
 use ui::{Color, Label, LabelSize, prelude::*};
-use util::TryFutureExt as _;
+use util::{ResultExt as _, TryFutureExt as _};
 use workspace::{
     Workspace,
     item::{Item, ItemEvent},
 };
+
+/// Screen-space threshold: movement below this is treated as a click (select only, no pin).
+const PIN_DRAG_THRESHOLD_PX: f32 = 3.0;
 
 use super::element::SemanticMapCanvasElement;
 use super::skins::vibe::VibeSkin;
@@ -226,6 +229,20 @@ impl SemanticMapItem {
             return;
         };
         let position = (node.rect.origin.x, node.rect.origin.y);
+        let zoom = if self.zoom.abs() < f32::EPSILON {
+            1.0
+        } else {
+            self.zoom
+        };
+        let screen_dx = (position.0 - drag.origin.x) * zoom;
+        let screen_dy = (position.1 - drag.origin.y) * zoom;
+        // Click (no meaningful move): selection already applied on mouse-down; do not pin.
+        if screen_dx * screen_dx + screen_dy * screen_dy
+            <= PIN_DRAG_THRESHOLD_PX * PIN_DRAG_THRESHOLD_PX
+        {
+            self.refresh_view_model(cx);
+            return;
+        }
         let snapshot = self.project.read(cx).semantic_graph().read(cx).snapshot();
         let Some(key) = snapshot
             .graph
@@ -244,7 +261,7 @@ impl SemanticMapItem {
         let Some(serialization_key) = self.pins_key.clone() else {
             return;
         };
-        let Ok(json) = self.pins.to_json() else {
+        let Some(json) = self.pins.to_json().log_err() else {
             return;
         };
         let kvp = KeyValueStore::global(cx);
@@ -366,11 +383,17 @@ fn load_pins_from_kvp(
     let Some(key) = pins_key else {
         return CanvasPins::default();
     };
-    let Ok(Some(json)) = KeyValueStore::global(cx).read_kvp(key) else {
+    let Some(json) = KeyValueStore::global(cx)
+        .read_kvp(key)
+        .log_err()
+        .flatten()
+    else {
         return CanvasPins::default();
     };
     let snapshot = project.read(cx).semantic_graph().read(cx).snapshot();
-    CanvasPins::from_json(&json, &snapshot.graph).unwrap_or_default()
+    CanvasPins::from_json(&json, &snapshot.graph)
+        .log_err()
+        .unwrap_or_default()
 }
 
 impl EventEmitter<ItemEvent> for SemanticMapItem {}
