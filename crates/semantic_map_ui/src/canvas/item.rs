@@ -1,12 +1,16 @@
+use db::kvp::KeyValueStore;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, point, px,
+    SharedString, Styled, Subscription, Task, Window, div, point, px,
 };
 use project::Project;
-use semantic_graph::{EdgeKind, Lens, NodeId, SemanticGraphEvent};
+use semantic_graph::{
+    CanvasPins, EdgeKind, Lens, NodeId, SemanticGraphEvent, canvas_pins_kvp_key,
+};
 use settings::{Settings, SettingsStore};
 use ui::{Color, Label, LabelSize, prelude::*};
+use util::TryFutureExt as _;
 use workspace::{
     Workspace,
     item::{Item, ItemEvent},
@@ -18,15 +22,25 @@ use crate::{
     CanvasViewModel, SceneNode, SemanticMapSelection, SemanticMapSettings,
 };
 
+struct NodeDrag {
+    node_id: NodeId,
+    start_screen: Point<f32>,
+    origin: Point<f32>,
+}
+
 pub struct SemanticMapItem {
     project: Entity<Project>,
     selection: Entity<SemanticMapSelection>,
     focus_handle: FocusHandle,
     view_model: CanvasViewModel,
+    pins: CanvasPins,
+    pins_key: Option<String>,
     pan: Point<f32>,
     zoom: f32,
     panning: Option<Point<f32>>,
     pan_anchor: Point<f32>,
+    node_drag: Option<NodeDrag>,
+    _pending_pin_save: Task<Option<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -34,11 +48,13 @@ impl SemanticMapItem {
     pub fn new(
         project: Entity<Project>,
         selection: Entity<SemanticMapSelection>,
+        pins_key: Option<String>,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             let semantic_graph = project.read(cx).semantic_graph().clone();
+            let pins = load_pins_from_kvp(pins_key.as_deref(), &project, cx);
 
             let mut subscriptions = Vec::new();
             subscriptions.push(cx.subscribe(
@@ -62,10 +78,14 @@ impl SemanticMapItem {
                 selection,
                 focus_handle,
                 view_model: CanvasViewModel::default(),
+                pins,
+                pins_key,
                 pan: point(24.0, 24.0),
                 zoom: 1.0,
                 panning: None,
                 pan_anchor: point(0.0, 0.0),
+                node_drag: None,
+                _pending_pin_save: Task::ready(None),
                 _subscriptions: subscriptions,
             };
             this.refresh_view_model(cx);
@@ -86,7 +106,8 @@ impl SemanticMapItem {
         let settings = SemanticMapSettings::get_global(cx);
         let lens = Self::lens_from_settings(settings);
         let snapshot = self.project.read(cx).semantic_graph().read(cx).snapshot();
-        self.view_model = CanvasViewModel::from_snapshot(&snapshot, &lens);
+        self.view_model =
+            CanvasViewModel::from_snapshot_with_pins(&snapshot, &lens, Some(&self.pins));
         cx.notify();
     }
 
@@ -98,6 +119,9 @@ impl SemanticMapItem {
     }
 
     fn start_pan(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.node_drag.is_some() {
+            return;
+        }
         if event.button != MouseButton::Middle && event.button != MouseButton::Left {
             return;
         }
@@ -107,6 +131,9 @@ impl SemanticMapItem {
     }
 
     fn update_pan(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.node_drag.is_some() {
+            return;
+        }
         let Some(start) = self.panning else {
             return;
         };
@@ -122,6 +149,112 @@ impl SemanticMapItem {
         if self.panning.take().is_some() {
             cx.notify();
         }
+    }
+
+    fn start_node_drag(&mut self, node_id: NodeId, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(node) = self.view_model.nodes.iter().find(|node| node.id == node_id) else {
+            return;
+        };
+        self.panning = None;
+        self.node_drag = Some(NodeDrag {
+            node_id,
+            start_screen: point(event.position.x.into(), event.position.y.into()),
+            origin: point(node.rect.origin.x, node.rect.origin.y),
+        });
+        self.select_node(node_id, cx);
+        cx.notify();
+    }
+
+    fn update_node_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = &self.node_drag else {
+            return;
+        };
+        let current = point::<f32>(event.position.x.into(), event.position.y.into());
+        let zoom = if self.zoom.abs() < f32::EPSILON {
+            1.0
+        } else {
+            self.zoom
+        };
+        let world = point(
+            drag.origin.x + (current.x - drag.start_screen.x) / zoom,
+            drag.origin.y + (current.y - drag.start_screen.y) / zoom,
+        );
+        let node_id = drag.node_id;
+        if let Some(node) = self
+            .view_model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        {
+            node.rect.origin = world;
+        }
+        // Keep DependsOn polylines roughly aligned while dragging.
+        for edge in &mut self.view_model.edges {
+            if edge.from != node_id && edge.to != node_id {
+                continue;
+            }
+            let Some(from_node) = self.view_model.nodes.iter().find(|n| n.id == edge.from) else {
+                continue;
+            };
+            let Some(to_node) = self.view_model.nodes.iter().find(|n| n.id == edge.to) else {
+                continue;
+            };
+            edge.routed_path = vec![
+                point(
+                    from_node.rect.origin.x + from_node.rect.size.width / 2.0,
+                    from_node.rect.origin.y + from_node.rect.size.height / 2.0,
+                ),
+                point(
+                    to_node.rect.origin.x + to_node.rect.size.width / 2.0,
+                    to_node.rect.origin.y + to_node.rect.size.height / 2.0,
+                ),
+            ];
+        }
+        cx.notify();
+    }
+
+    fn end_node_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.node_drag.take() else {
+            return;
+        };
+        let Some(node) = self
+            .view_model
+            .nodes
+            .iter()
+            .find(|node| node.id == drag.node_id)
+        else {
+            return;
+        };
+        let position = (node.rect.origin.x, node.rect.origin.y);
+        let snapshot = self.project.read(cx).semantic_graph().read(cx).snapshot();
+        let Some(key) = snapshot
+            .graph
+            .nodes
+            .get(&drag.node_id)
+            .map(|node| node.key.clone())
+        else {
+            return;
+        };
+        self.pins.pin(key, position);
+        self.persist_pins(cx);
+        self.refresh_view_model(cx);
+    }
+
+    fn persist_pins(&mut self, cx: &mut Context<Self>) {
+        let Some(serialization_key) = self.pins_key.clone() else {
+            return;
+        };
+        let Ok(json) = self.pins.to_json() else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        self._pending_pin_save = cx.background_spawn(
+            async move {
+                kvp.write_kvp(serialization_key, json).await?;
+                anyhow::Ok(())
+            }
+            .log_err(),
+        );
     }
 
     fn dependency_names_for_selected(&self, cx: &App) -> Vec<SharedString> {
@@ -171,9 +304,13 @@ impl SemanticMapItem {
             .border_color(VibeSkin::card_border(selected, cx))
             .bg(VibeSkin::card_background(node.kind, cx))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.select_node(node_id, cx);
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.start_node_drag(node_id, event, cx);
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -209,15 +346,34 @@ impl SemanticMapItem {
             return;
         }
 
-        let item = SemanticMapItem::new(project, selection, cx);
+        let pins_key = workspace
+            .database_id()
+            .map(|id| i64::from(id).to_string())
+            .or_else(|| workspace.session_id())
+            .map(canvas_pins_kvp_key);
+        let item = SemanticMapItem::new(project, selection, pins_key, cx);
         pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(item), true, true, None, window, cx);
         });
     }
 }
 
-impl EventEmitter<ItemEvent> for SemanticMapItem {
+fn load_pins_from_kvp(
+    pins_key: Option<&str>,
+    project: &Entity<Project>,
+    cx: &App,
+) -> CanvasPins {
+    let Some(key) = pins_key else {
+        return CanvasPins::default();
+    };
+    let Ok(Some(json)) = KeyValueStore::global(cx).read_kvp(key) else {
+        return CanvasPins::default();
+    };
+    let snapshot = project.read(cx).semantic_graph().read(cx).snapshot();
+    CanvasPins::from_json(&json, &snapshot.graph).unwrap_or_default()
 }
+
+impl EventEmitter<ItemEvent> for SemanticMapItem {}
 
 impl Focusable for SemanticMapItem {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -263,12 +419,20 @@ impl Render for SemanticMapItem {
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                        this.update_pan(event, cx);
+                        if this.node_drag.is_some() {
+                            this.update_node_drag(event, cx);
+                        } else {
+                            this.update_pan(event, cx);
+                        }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                            this.end_pan(cx);
+                            if this.node_drag.is_some() {
+                                this.end_node_drag(cx);
+                            } else {
+                                this.end_pan(cx);
+                            }
                         }),
                     )
                     .on_mouse_up(

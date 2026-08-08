@@ -1,6 +1,6 @@
 use gpui::{point, size, Bounds, Point, SharedString};
 use semantic_graph::{
-    EdgeId, EdgeKind, IntentIndex, Lens, Node, NodeId, NodeKind, SemanticGraph,
+    CanvasPins, EdgeId, EdgeKind, IntentIndex, Lens, Node, NodeId, NodeKind, SemanticGraph,
     SemanticGraphSnapshot, hierarchy,
 };
 
@@ -65,9 +65,17 @@ impl PanelViewModel {
 
 impl CanvasViewModel {
     pub fn from_snapshot(snapshot: &SemanticGraphSnapshot, lens: &Lens) -> Self {
+        Self::from_snapshot_with_pins(snapshot, lens, None)
+    }
+
+    pub fn from_snapshot_with_pins(
+        snapshot: &SemanticGraphSnapshot,
+        lens: &Lens,
+        pins: Option<&CanvasPins>,
+    ) -> Self {
         // Only include nodes that hierarchy layout positions. Nested modules that
         // DFS would visit but layout does not place are intentionally omitted.
-        let positions = hierarchy::layout(&snapshot.graph, lens);
+        let positions = hierarchy::layout_with_pins(&snapshot.graph, lens, pins);
         let mut nodes = Vec::with_capacity(positions.len());
         for (&node_id, &(x, y)) in &positions {
             let Some(node) = snapshot.graph.nodes.get(&node_id) else {

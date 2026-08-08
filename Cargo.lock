@@ -16628,6 +16628,7 @@ name = "semantic_map_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "db",
  "gpui",
  "pretty_assertions",
  "project",
