@@ -5,3 +5,4 @@ mod store;
 
 pub use ids::*;
 pub use ir::*;
+pub use store::*;
