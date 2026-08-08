@@ -2219,6 +2219,23 @@ impl Project {
         &self.semantic_graph
     }
 
+    /// Rebuild the semantic graph for the first visible worktree.
+    ///
+    /// No-op when there are no visible worktrees. Settings gating is Task 8/10;
+    /// callers should only invoke this when the feature is enabled.
+    pub fn reindex_semantic_graph(&self, cx: &mut App) {
+        let Some(worktree) = self.visible_worktrees(cx).next() else {
+            return;
+        };
+        let (root, worktree_id) = {
+            let worktree = worktree.read(cx);
+            (worktree.abs_path().clone(), worktree.id())
+        };
+        self.semantic_graph.update(cx, |store, cx| {
+            store.reindex(root, worktree_id, cx);
+        });
+    }
+
     #[inline]
     pub fn worktree_store(&self) -> Entity<WorktreeStore> {
         self.worktree_store.clone()

@@ -94,7 +94,8 @@ impl GraphIndexer {
     }
 }
 
-/// Placeholder for dirty-path → reindex job mapping (Task 7).
+/// Classify dirty paths into scopes for future incremental reindex jobs.
+/// Full-graph rebuild currently goes through [`SemanticGraphStore::reindex`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidationScope {
     WorkspacePackages,

@@ -1,13 +1,15 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use collections::HashMap;
-use gpui::{Context, EventEmitter, SharedString};
+use gpui::{Context, EventEmitter, SharedString, Task};
 use util::rel_path::RelPath;
 use worktree::WorktreeId;
 
 use crate::{
-    GraphPatch, GraphRevision, Intent, ModuleRef, NodeId, NodeKey, SemanticGraph, SourceLocation,
+    build_initial_graph, GraphPatch, GraphRevision, Intent, ModuleRef, NodeId, NodeKey,
+    SemanticGraph, SourceLocation,
 };
 
 /// Map from node id → intent text for that node.
@@ -44,6 +46,7 @@ pub struct SemanticGraphStore {
     graph: SemanticGraph,
     intents: IntentIndex,
     status: GraphStatus,
+    reindex_task: Option<Task<()>>,
 }
 
 impl EventEmitter<SemanticGraphEvent> for SemanticGraphStore {}
@@ -54,6 +57,7 @@ impl SemanticGraphStore {
             graph: SemanticGraph::default(),
             intents: IntentIndex::default(),
             status: GraphStatus::Idle,
+            reindex_task: None,
         }
     }
 
@@ -64,6 +68,56 @@ impl SemanticGraphStore {
             intents: Arc::new(self.intents.clone()),
             status: self.status.clone(),
         }
+    }
+
+    pub fn status(&self) -> &GraphStatus {
+        &self.status
+    }
+
+    pub fn replace_graph(
+        &mut self,
+        graph: SemanticGraph,
+        intents: IntentIndex,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph = graph;
+        self.intents = intents;
+        self.status = GraphStatus::Idle;
+        let revision = self.graph.revision();
+        cx.emit(SemanticGraphEvent::Updated { revision });
+        cx.notify();
+    }
+
+    /// Build the graph for `root` on a background thread, then apply on the foreground.
+    pub fn reindex(
+        &mut self,
+        root: Arc<Path>,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = GraphStatus::Indexing;
+        cx.notify();
+
+        let build = cx.background_spawn(async move { build_initial_graph(&root, worktree_id) });
+        self.reindex_task = Some(cx.spawn(async move |this, cx| {
+            let result = build.await;
+            match this.update(cx, |this, cx| match result {
+                Ok((graph, intents)) => {
+                    this.replace_graph(graph, intents, cx);
+                }
+                Err(error) => {
+                    this.status = GraphStatus::Error {
+                        message: SharedString::from(format!("{error:#}")),
+                    };
+                    cx.notify();
+                }
+            }) {
+                Ok(()) => {}
+                Err(_) => {
+                    // Store was dropped while indexing; nothing to update.
+                }
+            }
+        }));
     }
 
     pub fn apply_patch(
@@ -132,6 +186,7 @@ fn module_ref_covers_path(module_ref: &ModuleRef, path: &Arc<RelPath>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -315,5 +370,35 @@ mod tests {
             })
         });
         assert_eq!(under_module, vec![module_id]);
+    }
+
+    #[gpui::test]
+    async fn reindex_transitions_indexing_to_idle(cx: &mut TestAppContext) {
+        let root = Arc::<Path>::from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("test_data/simple_workspace")
+                .into_boxed_path(),
+        );
+        let worktree_id = WorktreeId::from_usize(1);
+        let store = cx.new(|cx| SemanticGraphStore::new(cx));
+
+        store.update(cx, |store, cx| {
+            store.reindex(root.clone(), worktree_id, cx);
+        });
+
+        let status = store.read_with(cx, |store, _| store.status().clone());
+        assert_eq!(status, GraphStatus::Indexing);
+
+        cx.run_until_parked();
+
+        let snap = store.read_with(cx, |store, _| store.snapshot());
+        assert_eq!(snap.status, GraphStatus::Idle);
+        assert!(
+            snap.graph.nodes.values().any(|node| {
+                node.kind == NodeKind::Module && node.display_name.as_ref() == "core_lib"
+            }),
+            "expected cargo fixture modules after reindex"
+        );
+        assert!(!snap.intents.is_empty());
     }
 }
