@@ -238,6 +238,9 @@ pub struct SettingsContent {
 
     pub project_panel: Option<ProjectPanelSettingsContent>,
 
+    /// Settings for the Semantic Map panel and canvas.
+    pub semantic_map: Option<SemanticMapSettingsContent>,
+
     /// Configuration for Node-related features
     pub node: Option<NodeBinarySettings>,
 
@@ -1082,6 +1085,92 @@ pub enum HourFormat {
     #[default]
     Hour12,
     Hour24,
+}
+
+/// Settings for the Semantic Map feature (`semantic_map` in settings.json).
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct SemanticMapSettingsContent {
+    /// Whether the Semantic Map feature is enabled.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Default canvas skin for the Semantic Map.
+    ///
+    /// Default: vibe
+    pub default_skin: Option<SemanticMapSkin>,
+    /// Whether to hide external dependency nodes.
+    ///
+    /// Default: true
+    pub hide_external: Option<bool>,
+    /// Whether to hide test-only modules and crates.
+    ///
+    /// Default: true
+    pub hide_tests: Option<bool>,
+    /// Whether to open the Semantic Map canvas when a project opens.
+    ///
+    /// Default: false
+    pub auto_open_canvas_on_project_open: Option<bool>,
+    /// Maximum module nesting depth to expand automatically.
+    ///
+    /// Default: 3
+    pub module_depth: Option<usize>,
+    /// Soft cap on nodes shown without progressive disclosure.
+    ///
+    /// Default: 500
+    pub max_auto_nodes: Option<usize>,
+    /// Intent enrichment settings.
+    pub intent: Option<SemanticMapIntentSettingsContent>,
+    /// Subsystem clustering settings.
+    pub cluster: Option<SemanticMapClusterSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct SemanticMapIntentSettingsContent {
+    /// Whether to use an LLM to enrich node intents.
+    ///
+    /// Default: false
+    pub llm: Option<bool>,
+    /// Only request LLM intents for currently visible nodes.
+    ///
+    /// Default: true
+    pub llm_on_visible_only: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct SemanticMapClusterSettingsContent {
+    /// Minimum number of subsystems the clusterer should produce.
+    ///
+    /// Default: 3
+    pub min_subsystems: Option<usize>,
+    /// Maximum number of subsystems the clusterer should produce.
+    ///
+    /// Default: 16
+    pub max_subsystems: Option<usize>,
+}
+
+/// Visual skin used when rendering the Semantic Map canvas.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticMapSkin {
+    /// Default cognitive / “vibe” skin.
+    #[default]
+    Vibe,
 }
 
 #[with_fallible_options]

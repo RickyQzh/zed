@@ -126,6 +126,35 @@
     // limit_content_width is enabled.
     "max_width": 800,
   },
+  // Semantic Map settings (project structure visualization).
+  "semantic_map": {
+    // Whether the Semantic Map feature is enabled.
+    "enabled": false,
+    // Default canvas skin. Currently: "vibe".
+    "default_skin": "vibe",
+    // Whether to hide external dependency nodes.
+    "hide_external": true,
+    // Whether to hide test-only modules and crates.
+    "hide_tests": true,
+    // Whether to open the Semantic Map canvas when a project opens.
+    "auto_open_canvas_on_project_open": false,
+    // Maximum module nesting depth to expand automatically.
+    "module_depth": 3,
+    // Soft cap on nodes shown without progressive disclosure.
+    "max_auto_nodes": 500,
+    "intent": {
+      // Whether to use an LLM to enrich node intents.
+      "llm": false,
+      // Only request LLM intents for currently visible nodes.
+      "llm_on_visible_only": true,
+    },
+    "cluster": {
+      // Minimum number of subsystems the clusterer should produce.
+      "min_subsystems": 3,
+      // Maximum number of subsystems the clusterer should produce.
+      "max_subsystems": 16,
+    },
+  },
   // Determines the modifier to be used to add multiple cursors with the mouse. The open hover link mouse gestures will adapt such that it do not conflict with the multicursor modifier.
   //
   // 1. Maps to `Alt` on Linux and Windows and to `Option` on MacOS:
