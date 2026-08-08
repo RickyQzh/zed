@@ -37,8 +37,8 @@ command palette.
 
 When the panel is focused, Zed indexes the project and lists nodes (subsystems
 and modules) with short intent summaries. Click a row to select it. Use
-{#action semantic_map::OpenSelectedSource} (or double-click where supported) to
-jump to the node's source.
+{#action semantic_map::OpenSelectedSource} or double-click a row to jump to
+the node's source.
 
 Status chips in the panel header show whether the graph is indexing, ready,
 partial (truncated by budget), or in error. Use **Reindex**
@@ -53,8 +53,10 @@ Open the spatial canvas with {#action semantic_map::OpenCanvas}, or click
 **Open Canvas** in the panel.
 
 The canvas lays out nodes as cards with dependency edges. Pan and zoom to
-explore. Select a card to sync selection with the panel. Double-click a module
-card to open its source when a location is available.
+explore. Select a card to sync selection with the panel. The canvas does not
+open files on double-click—select a card, then use
+{#action semantic_map::OpenSelectedSource} or open the node from the panel
+when a location is available.
 
 To open the canvas automatically when a project opens:
 
