@@ -120,6 +120,46 @@ impl Node {
             flags: NodeFlags::default(),
         }
     }
+
+    pub fn module(
+        id: NodeId,
+        key: NodeKey,
+        display_name: impl Into<SharedString>,
+        location: Option<SourceLocation>,
+        payload: ModulePayload,
+        flags: NodeFlags,
+    ) -> Self {
+        Self {
+            id,
+            key,
+            kind: NodeKind::Module,
+            display_name: display_name.into(),
+            abbrev: None,
+            location,
+            payload: NodePayload::Module(payload),
+            flags,
+        }
+    }
+
+    pub fn entry(
+        id: NodeId,
+        key: NodeKey,
+        display_name: impl Into<SharedString>,
+        location: Option<SourceLocation>,
+        entry_kind: EntryKind,
+        flags: NodeFlags,
+    ) -> Self {
+        Self {
+            id,
+            key,
+            kind: NodeKind::Entry,
+            display_name: display_name.into(),
+            abbrev: None,
+            location,
+            payload: NodePayload::Entry(EntryPayload { entry_kind }),
+            flags,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, EnumIter)]
@@ -254,6 +294,34 @@ pub enum EdgeKind {
     Calls,
     References,
     DesignLinks,
+}
+
+impl EdgeKind {
+    pub fn discriminant(self) -> u8 {
+        self as u8
+    }
+}
+
+impl Edge {
+    pub fn new(kind: EdgeKind, from: NodeId, to: NodeId) -> Self {
+        Self {
+            id: EdgeId::from_endpoints(kind.discriminant(), from, to),
+            kind,
+            from,
+            to,
+            weight: 1.0,
+            location: None,
+            payload: EdgePayload::default(),
+        }
+    }
+
+    pub fn contains(from: NodeId, to: NodeId) -> Self {
+        Self::new(EdgeKind::Contains, from, to)
+    }
+
+    pub fn depends_on(from: NodeId, to: NodeId) -> Self {
+        Self::new(EdgeKind::DependsOn, from, to)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
