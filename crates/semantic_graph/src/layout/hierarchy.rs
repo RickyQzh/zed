@@ -1,5 +1,6 @@
 use collections::HashMap;
 
+use crate::layout::pins::CanvasPins;
 use crate::{Lens, Node, NodeId, NodeKind, SemanticGraph};
 
 pub const CELL_WIDTH: f32 = 240.0;
@@ -12,6 +13,15 @@ pub const CELL_HEIGHT: f32 = 120.0;
 /// contained directly by the project (orphans) occupy columns after all
 /// subsystems, also ordered by `display_name`.
 pub fn layout(graph: &SemanticGraph, lens: &Lens) -> HashMap<NodeId, (f32, f32)> {
+    layout_with_pins(graph, lens, None)
+}
+
+/// Like [`layout`], then applies [`CanvasPins`] overrides when present.
+pub fn layout_with_pins(
+    graph: &SemanticGraph,
+    lens: &Lens,
+    pins: Option<&CanvasPins>,
+) -> HashMap<NodeId, (f32, f32)> {
     let mut positions = HashMap::default();
     let Some(root_id) = resolve_root(graph, lens) else {
         return positions;
@@ -43,6 +53,10 @@ pub fn layout(graph: &SemanticGraph, lens: &Lens) -> HashMap<NodeId, (f32, f32)>
             module_id,
             ((start_column + index) as f32 * CELL_WIDTH, 0.0),
         );
+    }
+
+    if let Some(pins) = pins {
+        pins.apply_overrides(&mut positions);
     }
 
     positions
