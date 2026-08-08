@@ -1,16 +1,18 @@
+mod canvas;
 mod panel;
 mod selection;
 mod settings;
 mod view_model;
 
-pub use panel::{OpenSelectedSource, Reindex, SemanticMapPanel, ToggleFocus};
+pub use canvas::SemanticMapItem;
+pub use panel::{
+    OpenCanvas, OpenSelectedSource, Reindex, SemanticMapPanel, ToggleFocus,
+};
 pub use selection::SemanticMapSelection;
 pub use settings::{
     SemanticMapClusterSettings, SemanticMapIntentSettings, SemanticMapSettings, SemanticMapSkin,
 };
-pub use view_model::{
-    CanvasViewModel, PanelRow, PanelViewModel, SceneEdge, SceneNode,
-};
+pub use view_model::{CanvasViewModel, PanelRow, PanelViewModel, SceneEdge, SceneNode};
 
 pub fn init(cx: &mut gpui::App) {
     use ::settings::Settings as _;
