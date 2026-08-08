@@ -158,27 +158,7 @@ impl SemanticMapPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(location) = self
-            .project
-            .read(cx)
-            .semantic_graph()
-            .read(cx)
-            .snapshot()
-            .graph
-            .nodes
-            .get(&node_id)
-            .and_then(|node| node.location.clone())
-        else {
-            return;
-        };
-        let project_path = project_path_from_source_location(&location);
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace
-                    .open_path(project_path, None, true, window, cx)
-                    .detach_and_log_err(cx);
-            })
-            .log_err();
+        open_node_source(&self.workspace, &self.project, node_id, window, cx);
     }
 
     fn open_selected_source(
@@ -190,7 +170,7 @@ impl SemanticMapPanel {
         let Some(node_id) = self.selection.read(cx).selected.first().copied() else {
             return;
         };
-        self.open_node_source(node_id, window, cx);
+        open_node_source(&self.workspace, &self.project, node_id, window, cx);
     }
 
     fn reindex(&mut self, _: &Reindex, _window: &mut Window, cx: &mut Context<Self>) {
@@ -267,6 +247,36 @@ fn project_path_from_source_location(location: &SourceLocation) -> ProjectPath {
         worktree_id: location.worktree_id,
         path: location.path.clone(),
     }
+}
+
+fn open_node_source(
+    workspace: &WeakEntity<Workspace>,
+    project: &Entity<Project>,
+    node_id: NodeId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(location) = project
+        .read(cx)
+        .semantic_graph()
+        .read(cx)
+        .snapshot()
+        .graph
+        .nodes
+        .get(&node_id)
+        .and_then(|node| node.location.clone())
+    else {
+        return;
+    };
+
+    let project_path = project_path_from_source_location(&location);
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace
+                .open_path(project_path, None, true, window, cx)
+                .detach_and_log_err(cx);
+        })
+        .log_err();
 }
 
 impl EventEmitter<PanelEvent> for SemanticMapPanel {}
@@ -404,6 +414,14 @@ pub fn register_panel_actions(workspace: &mut Workspace, _: Option<&mut Window>,
             return;
         }
         workspace.toggle_panel_focus::<SemanticMapPanel>(window, cx);
+    });
+    workspace.register_action(|workspace, _: &OpenSelectedSource, window, cx| {
+        let Some(panel) = workspace.panel::<SemanticMapPanel>(cx) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            panel.open_selected_source(&OpenSelectedSource, window, cx);
+        });
     });
     workspace.register_action(|workspace, _: &Reindex, window, cx| {
         if let Some(panel) = workspace.panel::<SemanticMapPanel>(cx) {
@@ -544,5 +562,23 @@ mod tests {
         let truncated = truncate_intent(&long);
         assert!(truncated.ends_with('…'));
         assert_eq!(truncated.chars().count(), INTENT_TRUNCATE_CHARS + 1);
+    }
+
+    #[test]
+    fn maps_source_location_to_project_path() {
+        use util::rel_path::RelPath;
+
+        let worktree_id = WorktreeId::from_usize(7);
+        let path = RelPath::from_unix_str("src/lib.rs").expect("valid unix path");
+        let location = SourceLocation {
+            worktree_id,
+            path: Arc::from(path),
+            range: None,
+            symbol: None,
+        };
+
+        let project_path = project_path_from_source_location(&location);
+        assert_eq!(project_path.worktree_id, worktree_id);
+        assert_eq!(project_path.path.as_ref(), location.path.as_ref());
     }
 }
