@@ -9,7 +9,7 @@ use crate::extract::{
     cluster_subsystems, extract_cargo_workspace, extract_generic, extract_rust_modules_with_base,
     load_pin_config_from_root, ClusterConfig,
 };
-use crate::intent::StaticIntentProvider;
+use crate::intent::{LlmIntentProvider, StaticIntentProvider};
 use crate::{
     EdgeId, GraphPatch, GraphStatus, IntentIndex, ModuleRef, NodeId, NodeKind, SemanticGraph,
     SemanticGraphSnapshot,
@@ -18,14 +18,19 @@ use crate::{
 const DEFAULT_MODULE_DEPTH: u32 = 2;
 
 /// Sync orchestration: Cargo workspace when present, otherwise generic thin extract,
-/// then rust module depth (Cargo), subsystem clustering, then static intents.
+/// then rust module depth (Cargo), subsystem clustering, then static intents,
+/// then optional LLM intent enrichment (settings-gated stub).
 ///
 /// When the resulting graph exceeds `max_auto_nodes`, excess nodes are dropped and the
 /// third return value is `true` (caller should surface [`GraphStatus::Partial`]).
+///
+/// `intent_llm` gates [`LlmIntentProvider`]; when false (default), enrichment is skipped
+/// and no model service is required.
 pub fn build_initial_graph(
     root: &Path,
     worktree_id: WorktreeId,
     max_auto_nodes: usize,
+    intent_llm: bool,
 ) -> Result<(SemanticGraph, IntentIndex, bool)> {
     let mut graph = SemanticGraph::default();
     let mut truncated = false;
@@ -53,6 +58,9 @@ pub fn build_initial_graph(
     graph.apply_patch(patch)?;
 
     let mut intents = StaticIntentProvider::enrich(&graph, root)?;
+    for intent in LlmIntentProvider.enrich_if_enabled(intent_llm, &graph, &intents) {
+        intents.insert(intent.subject, intent);
+    }
     truncated |= enforce_max_auto_nodes(&mut graph, &mut intents, max_auto_nodes)?;
     Ok((graph, intents, truncated))
 }
@@ -179,7 +187,8 @@ impl GraphIndexer {
         root: &Path,
         worktree_id: WorktreeId,
     ) -> Result<SemanticGraphSnapshot> {
-        let (graph, intents, truncated) = build_initial_graph(root, worktree_id, usize::MAX)?;
+        let (graph, intents, truncated) =
+            build_initial_graph(root, worktree_id, usize::MAX, false)?;
         Ok(SemanticGraphSnapshot {
             revision: graph.revision(),
             graph: Arc::new(graph),
@@ -232,13 +241,14 @@ mod tests {
     use worktree::WorktreeId;
 
     use super::{build_initial_graph, GraphIndexer};
+    use crate::intent::StaticIntentProvider;
     use crate::{EdgeKind, NodeKind};
 
     #[test]
     fn build_initial_graph_cargo_fixture_has_core_lib_intent() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
         let (graph, intents, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
         assert!(!truncated);
         assert!(
             graph.nodes.values().any(|node| {
@@ -277,7 +287,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
         let max_auto_nodes = 2;
         let (graph, _intents, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes, false).unwrap();
         assert!(truncated);
         assert!(graph.nodes.len() <= max_auto_nodes);
     }
@@ -289,7 +299,7 @@ mod tests {
         // Cluster then trim must still surface Subsystem nodes (pins / auto clusters)
         // ahead of dropping Modules.
         let unlimited =
-            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
         let (full_graph, _, _) = unlimited;
         let module_only_count = full_graph
             .nodes
@@ -300,7 +310,7 @@ mod tests {
         // but large enough that Project + at least one Subsystem can survive the trim.
         let max_auto_nodes = module_only_count.max(2);
         let (graph, _intents, truncated) =
-            build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes).unwrap();
+            build_initial_graph(&root, WorktreeId::from_usize(1), max_auto_nodes, false).unwrap();
         assert!(truncated);
         assert!(graph.nodes.len() <= max_auto_nodes);
         assert!(
@@ -310,5 +320,39 @@ mod tests {
                 .any(|node| node.kind == NodeKind::Subsystem),
             "expected clustering to run before trim so Subsystem nodes are retained"
         );
+    }
+
+    #[test]
+    fn build_with_intent_llm_disabled_keeps_static_intents_offline() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
+        let (graph, intents, truncated) =
+            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
+        assert!(!truncated);
+        assert!(!intents.is_empty());
+        assert!(
+            intents
+                .values()
+                .all(|intent| matches!(intent.source, crate::IntentSource::Static)),
+            "disabled LLM path must leave static intents untouched without a model"
+        );
+        assert_eq!(intents.len(), StaticIntentProvider::enrich(&graph, &root).unwrap().len());
+    }
+
+    #[test]
+    fn build_with_intent_llm_enabled_stub_leaves_static_intents() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
+        let (graph, intents_off, _) =
+            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, false).unwrap();
+        let (_graph_on, intents_on, truncated) =
+            build_initial_graph(&root, WorktreeId::from_usize(1), usize::MAX, true).unwrap();
+        assert!(!truncated);
+        // Stub returns no LLM intents; static index must stay intact (no error required).
+        assert_eq!(intents_on.len(), intents_off.len());
+        for (node_id, intent) in &intents_off {
+            let on = intents_on.get(node_id).expect("static intent retained");
+            assert_eq!(on.summary, intent.summary);
+            assert!(matches!(on.source, crate::IntentSource::Static));
+        }
+        let _ = graph;
     }
 }
