@@ -1,7 +1,7 @@
 # Semantic Map Design
 
 **Date:** 2026-08-08  
-**Status:** Draft for review  
+**Status:** Phase A implementation planned  
 **Working title:** Semantic Map — project-structure visualization for vibe coding on Zed  
 **Primary crates (proposed):** `semantic_graph`, `semantic_map_ui`
 
