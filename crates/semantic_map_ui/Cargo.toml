@@ -14,7 +14,9 @@ doctest = false
 
 [dependencies]
 gpui.workspace = true
+semantic_graph.workspace = true
 settings.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+worktree.workspace = true
