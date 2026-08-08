@@ -13,10 +13,22 @@ path = "src/semantic_map_ui.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
 gpui.workspace = true
+project.workspace = true
 semantic_graph.workspace = true
 settings.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
 worktree.workspace = true

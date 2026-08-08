@@ -1,0 +1,548 @@
+use std::ops::Range;
+
+use gpui::{
+    Action, App, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
+    Styled, Subscription, UniformListScrollHandle, WeakEntity, Window, actions, div, px,
+    uniform_list,
+};
+use project::{Project, ProjectPath};
+use semantic_graph::{Lens, NodeId, SemanticGraphEvent, SourceLocation};
+use settings::{Settings, SettingsStore};
+use ui::{Color, Label, LabelSize, ListItem, prelude::*};
+use util::ResultExt as _;
+use workspace::{
+    Workspace,
+    dock::{DockPosition, Panel, PanelEvent},
+};
+
+use crate::{
+    PanelRow, PanelViewModel, SemanticMapSelection, SemanticMapSettings,
+};
+
+actions!(
+    semantic_map,
+    [
+        /// Toggles focus on the Semantic Map panel.
+        ToggleFocus,
+        /// Opens the source location for the selected semantic map node.
+        OpenSelectedSource,
+        /// Rebuilds the semantic graph for the current project.
+        Reindex,
+    ]
+);
+
+const PANEL_KEY: &str = "SemanticMapPanel";
+const DEFAULT_WIDTH: Pixels = px(260.);
+const INTENT_TRUNCATE_CHARS: usize = 72;
+
+pub struct SemanticMapPanel {
+    project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
+    selection: Entity<SemanticMapSelection>,
+    focus_handle: FocusHandle,
+    view_model: PanelViewModel,
+    position: DockPosition,
+    has_reindexed: bool,
+    scroll_handle: UniformListScrollHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SemanticMapPanel {
+    pub async fn load(
+        workspace: WeakEntity<Workspace>,
+        mut cx: AsyncWindowContext,
+    ) -> anyhow::Result<Entity<Self>> {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            Self::new(workspace, window, cx)
+        })
+    }
+
+    pub fn new(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        let project = workspace.project().clone();
+        let workspace_handle = workspace.weak_handle();
+
+        cx.new(|cx| {
+            let selection = cx.new(|_cx| SemanticMapSelection::new());
+            let focus_handle = cx.focus_handle();
+            let semantic_graph = project.read(cx).semantic_graph().clone();
+
+            let mut subscriptions = Vec::new();
+            subscriptions.push(cx.subscribe(
+                &semantic_graph,
+                |this: &mut Self, _, event, cx| {
+                    if matches!(event, SemanticGraphEvent::Updated { .. }) {
+                        this.refresh_view_model(cx);
+                    }
+                },
+            ));
+            subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+                this.refresh_view_model(cx);
+                cx.notify();
+            }));
+
+            let mut this = Self {
+                project: project.clone(),
+                workspace: workspace_handle,
+                selection,
+                focus_handle,
+                view_model: PanelViewModel::default(),
+                position: DockPosition::Left,
+                has_reindexed: false,
+                scroll_handle: UniformListScrollHandle::new(),
+                _subscriptions: subscriptions,
+            };
+
+            this.refresh_view_model(cx);
+            if SemanticMapSettings::get_global(cx).enabled {
+                this.ensure_indexed(cx);
+            }
+
+            let _ = window;
+            this
+        })
+    }
+
+    pub fn selection(&self) -> &Entity<SemanticMapSelection> {
+        &self.selection
+    }
+
+    pub fn view_model(&self) -> &PanelViewModel {
+        &self.view_model
+    }
+
+    fn lens_from_settings(settings: &SemanticMapSettings) -> Lens {
+        Lens {
+            hide_external: settings.hide_external,
+            hide_tests: settings.hide_tests,
+            max_depth: Some(settings.module_depth as u32),
+            ..Lens::default()
+        }
+    }
+
+    fn refresh_view_model(&mut self, cx: &mut Context<Self>) {
+        let settings = SemanticMapSettings::get_global(cx);
+        let lens = Self::lens_from_settings(settings);
+        let snapshot = self.project.read(cx).semantic_graph().read(cx).snapshot();
+        self.view_model = PanelViewModel::from_snapshot(&snapshot, &lens);
+        cx.notify();
+    }
+
+    fn ensure_indexed(&mut self, cx: &mut Context<Self>) {
+        if self.has_reindexed {
+            return;
+        }
+        if !SemanticMapSettings::get_global(cx).enabled {
+            return;
+        }
+        self.project.update(cx, |project, cx| {
+            project.reindex_semantic_graph(cx);
+        });
+        self.has_reindexed = true;
+    }
+
+    fn select_node(&mut self, node_id: NodeId, cx: &mut Context<Self>) {
+        self.selection.update(cx, |selection, cx| {
+            selection.select([node_id], cx);
+        });
+        cx.notify();
+    }
+
+    fn open_node_source(
+        &self,
+        node_id: NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(location) = self
+            .project
+            .read(cx)
+            .semantic_graph()
+            .read(cx)
+            .snapshot()
+            .graph
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.location.clone())
+        else {
+            return;
+        };
+        let project_path = project_path_from_source_location(&location);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_path(project_path, None, true, window, cx)
+                    .detach_and_log_err(cx);
+            })
+            .log_err();
+    }
+
+    fn open_selected_source(
+        &mut self,
+        _: &OpenSelectedSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node_id) = self.selection.read(cx).selected.first().copied() else {
+            return;
+        };
+        self.open_node_source(node_id, window, cx);
+    }
+
+    fn reindex(&mut self, _: &Reindex, _window: &mut Window, cx: &mut Context<Self>) {
+        if !SemanticMapSettings::get_global(cx).enabled {
+            return;
+        }
+        self.project.update(cx, |project, cx| {
+            project.reindex_semantic_graph(cx);
+        });
+        self.has_reindexed = true;
+    }
+
+    fn render_row(
+        &self,
+        row: &PanelRow,
+        selected: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let node_id = row.node_id;
+        let name = row.name.clone();
+        let intent = row
+            .intent_summary
+            .as_ref()
+            .map(|summary| truncate_intent(summary));
+
+        ListItem::new(ElementId::Name(format!("semantic-map-row-{node_id:?}").into()))
+            .selectable(true)
+            .toggle_state(selected)
+            .indent_level(row.depth as usize)
+            .indent_step_size(px(12.))
+            .on_click({
+                let panel = cx.weak_entity();
+                move |event: &ClickEvent, window, cx| {
+                    panel
+                        .update(cx, |this, cx| {
+                            this.select_node(node_id, cx);
+                            if event.click_count() > 1 {
+                                this.open_node_source(node_id, window, cx);
+                            }
+                        })
+                        .log_err();
+                }
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .min_w_0()
+                    .child(Label::new(name).size(LabelSize::Small))
+                    .when_some(intent, |this, intent| {
+                        this.child(
+                            Label::new(intent)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+    }
+}
+
+fn truncate_intent(summary: &SharedString) -> SharedString {
+    let truncated: String = summary.chars().take(INTENT_TRUNCATE_CHARS).collect();
+    if summary.chars().count() > INTENT_TRUNCATE_CHARS {
+        format!("{truncated}…").into()
+    } else {
+        truncated.into()
+    }
+}
+
+fn project_path_from_source_location(location: &SourceLocation) -> ProjectPath {
+    ProjectPath {
+        worktree_id: location.worktree_id,
+        path: location.path.clone(),
+    }
+}
+
+impl EventEmitter<PanelEvent> for SemanticMapPanel {}
+
+impl Focusable for SemanticMapPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Panel for SemanticMapPanel {
+    fn persistent_name() -> &'static str {
+        "Semantic Map"
+    }
+
+    fn panel_key() -> &'static str {
+        PANEL_KEY
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        self.position
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    fn set_position(
+        &mut self,
+        position: DockPosition,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.position = position;
+        cx.notify();
+    }
+
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        DEFAULT_WIDTH
+    }
+
+    fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
+        SemanticMapSettings::get_global(cx)
+            .enabled
+            .then_some(IconName::FileTree)
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("Semantic Map")
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        Box::new(ToggleFocus)
+    }
+
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if active {
+            self.ensure_indexed(cx);
+        }
+    }
+
+    fn activation_priority(&self) -> u32 {
+        8
+    }
+
+    fn enabled(&self, cx: &App) -> bool {
+        SemanticMapSettings::get_global(cx).enabled
+    }
+}
+
+impl Render for SemanticMapPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let row_count = self.view_model.rows.len();
+        let enabled = SemanticMapSettings::get_global(cx).enabled;
+
+        v_flex()
+            .id("semantic-map-panel")
+            .key_context("SemanticMapPanel")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(cx.theme().colors().panel_background)
+            .on_action(cx.listener(Self::open_selected_source))
+            .on_action(cx.listener(Self::reindex))
+            .when(!enabled, |this| {
+                this.child(
+                    div()
+                        .p_3()
+                        .child(
+                            Label::new("Enable semantic_map in settings to use this panel.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .when(enabled && row_count == 0, |this| {
+                this.child(
+                    div()
+                        .p_3()
+                        .child(
+                            Label::new("No semantic map nodes yet. Focus the panel to index.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .when(enabled, |this| {
+                this.child(
+                    uniform_list(
+                        "semantic-map-rows",
+                        row_count,
+                        cx.processor(move |this, range: Range<usize>, window, cx| {
+                            let selected = this.selection.read(cx).selected.clone();
+                            range
+                                .filter_map(|index| {
+                                    let row = this.view_model.rows.get(index)?;
+                                    let is_selected = selected.contains(&row.node_id);
+                                    Some(
+                                        this.render_row(row, is_selected, window, cx)
+                                            .into_any_element(),
+                                    )
+                                })
+                                .collect()
+                        }),
+                    )
+                    .size_full()
+                    .track_scroll(&self.scroll_handle),
+                )
+            })
+    }
+}
+
+pub fn register_panel_actions(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Context<Workspace>) {
+    workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+        if !SemanticMapSettings::get_global(cx).enabled {
+            return;
+        }
+        workspace.toggle_panel_focus::<SemanticMapPanel>(window, cx);
+    });
+    workspace.register_action(|workspace, _: &Reindex, window, cx| {
+        if let Some(panel) = workspace.panel::<SemanticMapPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.reindex(&Reindex, window, cx);
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::TestAppContext;
+    use pretty_assertions::assert_eq;
+    use project::FakeFs;
+    use semantic_graph::{
+        GraphPatch, GraphRevision, GraphStatus, IntentIndex, Node, NodeFlags, NodeId, NodeKey,
+        NodeKind, SemanticGraph, SemanticGraphSnapshot, SubsystemPayload,
+    };
+    use serde_json::json;
+    use settings::SettingsStore;
+    use workspace::MultiWorkspace;
+    use worktree::WorktreeId;
+
+    use super::*;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            crate::init(cx);
+        });
+    }
+
+    fn stub_snapshot() -> (SemanticGraphSnapshot, NodeId, NodeId) {
+        let worktree_id = WorktreeId::from_usize(1);
+        let project_key = NodeKey::Project { worktree_id };
+        let project_id = NodeId::from_key(&project_key);
+        let project = Node::project(project_id, project_key.clone(), "demo");
+
+        let subsystem_key = NodeKey::Subsystem {
+            project: project_key.into(),
+            slug: "core".into(),
+        };
+        let subsystem_id = NodeId::from_key(&subsystem_key);
+        let subsystem = Node::subsystem(
+            subsystem_id,
+            subsystem_key,
+            "core",
+            SubsystemPayload {
+                member_count: 0,
+                cluster_score: 1.0,
+                pinned: false,
+            },
+            NodeFlags::default(),
+        );
+
+        let mut graph = SemanticGraph::default();
+        graph
+            .apply_patch(GraphPatch {
+                base: GraphRevision(0),
+                removed_nodes: Vec::new(),
+                removed_edges: Vec::new(),
+                upsert_nodes: vec![project, subsystem],
+                upsert_edges: vec![semantic_graph::Edge::contains(project_id, subsystem_id)],
+            })
+            .expect("patch applies");
+
+        let snapshot = SemanticGraphSnapshot {
+            revision: graph.revision(),
+            graph: Arc::new(graph),
+            intents: Arc::new(IntentIndex::default()),
+            status: GraphStatus::Idle,
+        };
+        (snapshot, project_id, subsystem_id)
+    }
+
+    #[gpui::test]
+    async fn panel_builds_rows_from_stub_store(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "src": { "lib.rs": "" } }))
+            .await;
+
+        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        let (snapshot, project_id, subsystem_id) = stub_snapshot();
+        project.update(cx, |project, cx| {
+            project.semantic_graph().update(cx, |store, cx| {
+                store.replace_graph(
+                    (*snapshot.graph).clone(),
+                    (*snapshot.intents).clone(),
+                    cx,
+                );
+            });
+        });
+
+        // Enable the feature for this test so the panel is active.
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .semantic_map
+                        .get_or_insert_default()
+                        .enabled = Some(true);
+                });
+            });
+        });
+
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+
+        let panel = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    SemanticMapPanel::new(workspace, window, cx)
+                })
+            })
+            .unwrap();
+
+        panel.read_with(cx, |panel, _| {
+            let ids: Vec<_> = panel.view_model().rows.iter().map(|row| row.node_id).collect();
+            assert_eq!(ids, vec![project_id, subsystem_id]);
+            assert_eq!(panel.view_model().rows[0].kind, NodeKind::Project);
+            assert_eq!(panel.view_model().rows[1].kind, NodeKind::Subsystem);
+            assert_eq!(panel.view_model().rows[1].depth, 1);
+        });
+    }
+
+    #[test]
+    fn truncates_long_intent_summaries() {
+        let long: SharedString = "a".repeat(100).into();
+        let truncated = truncate_intent(&long);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncated.chars().count(), INTENT_TRUNCATE_CHARS + 1);
+    }
+}
