@@ -183,6 +183,7 @@ members = [
     "crates/schema_generator",
     "crates/search",
     "crates/semantic_graph",
+    "crates/semantic_map_ui",
     "crates/session",
     "crates/settings",
     "crates/settings_content",
@@ -450,6 +451,7 @@ scheduler = { path = "crates/scheduler" }
 sandbox = { path = "crates/sandbox" }
 search = { path = "crates/search" }
 semantic_graph = { path = "crates/semantic_graph" }
+semantic_map_ui = { path = "crates/semantic_map_ui" }
 session = { path = "crates/session" }
 sidebar = { path = "crates/sidebar" }
 settings = { path = "crates/settings" }

@@ -1,0 +1,20 @@
+[package]
+name = "semantic_map_ui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/semantic_map_ui.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+settings.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
