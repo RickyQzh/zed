@@ -164,9 +164,11 @@ impl SemanticMapPanel {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
         }
-        let max_auto_nodes = SemanticMapSettings::get_global(cx).max_auto_nodes;
+        let settings = SemanticMapSettings::get_global(cx);
+        let max_auto_nodes = settings.max_auto_nodes;
+        let intent_llm = settings.intent.llm;
         self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(max_auto_nodes, cx);
+            project.reindex_semantic_graph(max_auto_nodes, intent_llm, cx);
         });
         self.has_reindexed = true;
     }
@@ -203,9 +205,11 @@ impl SemanticMapPanel {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
         }
-        let max_auto_nodes = SemanticMapSettings::get_global(cx).max_auto_nodes;
+        let settings = SemanticMapSettings::get_global(cx);
+        let max_auto_nodes = settings.max_auto_nodes;
+        let intent_llm = settings.intent.llm;
         self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(max_auto_nodes, cx);
+            project.reindex_semantic_graph(max_auto_nodes, intent_llm, cx);
         });
         self.has_reindexed = true;
     }

@@ -2226,7 +2226,13 @@ impl Project {
     ///
     /// `max_auto_nodes` caps auto-indexed graph size; overflow yields
     /// [`semantic_graph::GraphStatus::Partial`].
-    pub fn reindex_semantic_graph(&self, max_auto_nodes: usize, cx: &mut App) {
+    /// `intent_llm` gates optional LLM intent enrichment (stub; offline when false).
+    pub fn reindex_semantic_graph(
+        &self,
+        max_auto_nodes: usize,
+        intent_llm: bool,
+        cx: &mut App,
+    ) {
         let Some(worktree) = self.visible_worktrees(cx).next() else {
             return;
         };
@@ -2235,7 +2241,7 @@ impl Project {
             (worktree.abs_path().clone(), worktree.id())
         };
         self.semantic_graph.update(cx, |store, cx| {
-            store.reindex(root, worktree_id, max_auto_nodes, cx);
+            store.reindex(root, worktree_id, max_auto_nodes, intent_llm, cx);
         });
     }
 

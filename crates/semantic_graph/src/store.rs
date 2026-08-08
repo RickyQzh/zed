@@ -102,11 +102,15 @@ impl SemanticGraphStore {
     ///
     /// When the built graph would exceed `max_auto_nodes`, nodes are truncated and
     /// status becomes [`GraphStatus::Partial`].
+    ///
+    /// `intent_llm` gates optional LLM intent enrichment (stub); false keeps the
+    /// offline static-intent path and does not require a model service.
     pub fn reindex(
         &mut self,
         root: Arc<Path>,
         worktree_id: WorktreeId,
         max_auto_nodes: usize,
+        intent_llm: bool,
         cx: &mut Context<Self>,
     ) {
         self.graph = SemanticGraph::default();
@@ -117,7 +121,7 @@ impl SemanticGraphStore {
         cx.notify();
 
         let build = cx.background_spawn(async move {
-            build_initial_graph(&root, worktree_id, max_auto_nodes)
+            build_initial_graph(&root, worktree_id, max_auto_nodes, intent_llm)
         });
         self.reindex_task = Some(cx.spawn(async move |this, cx| {
             let result = build.await;
@@ -412,7 +416,7 @@ mod tests {
         let store = cx.new(|cx| SemanticGraphStore::new(cx));
 
         store.update(cx, |store, cx| {
-            store.reindex(root.clone(), worktree_id, usize::MAX, cx);
+            store.reindex(root.clone(), worktree_id, usize::MAX, false, cx);
         });
 
         let status = store.read_with(cx, |store, _| store.status().clone());
@@ -444,7 +448,7 @@ mod tests {
         // Fixture has multiple modules/nodes; a tiny budget must truncate.
         let max_auto_nodes = 2;
         store.update(cx, |store, cx| {
-            store.reindex(root.clone(), worktree_id, max_auto_nodes, cx);
+            store.reindex(root.clone(), worktree_id, max_auto_nodes, false, cx);
         });
         cx.run_until_parked();
 

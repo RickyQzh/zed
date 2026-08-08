@@ -1,5 +1,7 @@
+mod llm_provider;
 mod static_provider;
 
+pub use llm_provider::LlmIntentProvider;
 pub use static_provider::StaticIntentProvider;
 
 use anyhow::Result;
