@@ -6,6 +6,9 @@ mod ir;
 mod layout;
 mod store;
 
+#[cfg(test)]
+mod usability;
+
 pub use extract::*;
 pub use ids::*;
 pub use intent::*;

@@ -418,6 +418,76 @@ mod tests {
         )
     }
 
+    fn simple_workspace_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../semantic_graph/test_data/simple_workspace")
+    }
+
+    #[test]
+    fn panel_and_canvas_show_simple_workspace_modules() {
+        let root = simple_workspace_root();
+        let snapshot = semantic_graph::GraphIndexer::reindex_cargo_or_generic(
+            &root,
+            WorktreeId::from_usize(1),
+        )
+        .expect("fixture snapshot should build without a Project");
+
+        let panel = PanelViewModel::from_snapshot(&snapshot, &Lens::default());
+        let canvas = CanvasViewModel::from_snapshot(&snapshot, &Lens::default());
+
+        for expected in ["app", "core_lib"] {
+            assert!(
+                panel.rows.iter().any(|row| row.name.as_ref() == expected),
+                "panel should list {expected}, rows={:?}",
+                panel
+                    .rows
+                    .iter()
+                    .map(|row| row.name.to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                canvas
+                    .nodes
+                    .iter()
+                    .any(|node| node.title.as_ref() == expected),
+                "canvas should show a card for {expected}, titles={:?}",
+                canvas
+                    .nodes
+                    .iter()
+                    .map(|node| node.title.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let core_lib_row = panel
+            .rows
+            .iter()
+            .find(|row| row.name.as_ref() == "core_lib")
+            .expect("core_lib panel row");
+        let core_lib_intent = core_lib_row
+            .intent_summary
+            .as_ref()
+            .map(|summary| summary.to_lowercase())
+            .unwrap_or_default();
+        assert!(
+            core_lib_intent.contains("domain") || core_lib_intent.contains("logic"),
+            "core_lib panel row should surface fixture domain/logic intent, got {core_lib_intent:?}"
+        );
+
+        assert!(
+            panel.rows.iter().any(|row| {
+                row.kind == NodeKind::Subsystem
+                    && row
+                        .intent_summary
+                        .as_ref()
+                        .is_some_and(|summary| {
+                            summary.to_lowercase().contains("application binary")
+                        })
+            }),
+            "panel should show the pin summary as a subsystem intent"
+        );
+    }
+
     #[test]
     fn canvas_omits_nested_modules_not_positioned_by_layout() {
         // hierarchy::layout only places project→subsystem→module (and project→module
