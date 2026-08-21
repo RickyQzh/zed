@@ -151,7 +151,7 @@ fn cargo_extractor_lists_zed_workspace_members() {
     }
 }
 
-/// Full-graph dogfood of this repo. Ignored when a timed trial exceeds 5s.
+/// Full-graph dogfood of this repo (`max_auto_nodes` 500, `module_depth` 2).
 #[test]
 fn dogfood_zed_workspace_indexes_well_known_crates() {
     let root = zed_workspace_root();
