@@ -116,11 +116,17 @@ pub fn load_pin_config_from_root(root: &std::path::Path) -> Result<PinConfig> {
     load_pin_config(&text)
 }
 
+/// Slug for leftover modules that are neither pinned nor in a prefix group.
+pub const OTHER_SUBSYSTEM_SLUG: &str = "other";
+
 /// Cluster top-level Modules into Subsystem nodes; rewrite Contains forest.
 ///
-/// v1 algorithm (spec §5.3.3): seed one cluster per project-child Module, merge
-/// by undirected DependsOn affinity until count ≤ max (and prefer ≥ min when
-/// affinity remains), name from path segment / package prefix, then apply pins.
+/// Pins from `semantic_map.toml` are applied first. Remaining modules are
+/// grouped by package-name prefix (`gpui` + `gpui_macros` → `gpui`) when two
+/// or more share a root; everything else goes into a single [`OTHER_SUBSYSTEM_SLUG`]
+/// bucket. When the result still exceeds `max_subsystems`, the smallest
+/// unpinned prefix groups fold into `other` — never a synthetic `subsystem-N`
+/// mega-blob with leftover crate-named singletons.
 pub fn cluster_subsystems(
     graph: &SemanticGraph,
     config: ClusterConfig,
@@ -164,17 +170,7 @@ pub fn cluster_subsystems(
         });
     }
 
-    let mut clusters = seed_clusters(graph, &top_modules);
-    agglomerate(&mut clusters, graph, config);
-
-    // module_id → slug
     let mut assignment: BTreeMap<NodeId, String> = BTreeMap::new();
-    for cluster in &clusters {
-        for &module_id in &cluster.members {
-            assignment.insert(module_id, cluster.slug.clone());
-        }
-    }
-
     let mut pinned_modules: BTreeSet<NodeId> = BTreeSet::new();
     apply_pins(
         graph,
@@ -184,11 +180,25 @@ pub fn cluster_subsystems(
         &mut pinned_modules,
     );
 
+    let pinned_slugs: BTreeSet<String> = assignment.values().cloned().collect();
+    let unpinned: Vec<NodeId> = top_modules
+        .iter()
+        .copied()
+        .filter(|module_id| !assignment.contains_key(module_id))
+        .collect();
+    // Reserve room for leftover groups; never steal a slot from an applied pin.
+    let unpinned_budget = config
+        .max_subsystems
+        .max(1)
+        .saturating_sub(pinned_slugs.len())
+        .max(1);
+    assign_unpinned_by_prefix_or_other(graph, &top_modules, &unpinned, unpinned_budget, &mut assignment);
+
     // Ensure every top module is assigned.
     for &module_id in &top_modules {
         assignment
             .entry(module_id)
-            .or_insert_with(|| "uncategorized".to_string());
+            .or_insert_with(|| OTHER_SUBSYSTEM_SLUG.to_string());
     }
 
     // Group by slug.
@@ -256,156 +266,96 @@ pub fn cluster_subsystems(
     })
 }
 
-#[derive(Debug, Clone)]
-struct Cluster {
-    slug: String,
-    members: Vec<NodeId>,
-}
+fn assign_unpinned_by_prefix_or_other(
+    graph: &SemanticGraph,
+    top_modules: &[NodeId],
+    unpinned: &[NodeId],
+    max_unpinned_groups: usize,
+    assignment: &mut BTreeMap<NodeId, String>,
+) {
+    if unpinned.is_empty() {
+        return;
+    }
 
-fn seed_clusters(graph: &SemanticGraph, top_modules: &[NodeId]) -> Vec<Cluster> {
-    // Prefer grouping by shared path prefix under repo roots like crates/, apps/.
+    let all_names: BTreeSet<String> = top_modules
+        .iter()
+        .filter_map(|module_id| {
+            graph
+                .nodes
+                .get(module_id)
+                .map(|node| node.display_name.to_string())
+        })
+        .collect();
+
     let mut by_prefix: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
-    for &module_id in top_modules {
+    for &module_id in unpinned {
         let Some(node) = graph.nodes.get(&module_id) else {
+            assignment.insert(module_id, OTHER_SUBSYSTEM_SLUG.to_string());
             continue;
         };
-        let path = module_path(node).unwrap_or_else(|| node.display_name.to_string());
-        let prefix = seed_prefix(&path);
+        let prefix = package_prefix_root(node.display_name.as_ref(), &all_names);
         by_prefix.entry(prefix).or_default().push(module_id);
     }
 
-    by_prefix
-        .into_iter()
-        .map(|(prefix, members)| {
-            let slug = if members.len() == 1 {
-                graph
-                    .nodes
-                    .get(&members[0])
-                    .map(|node| node.display_name.to_string())
-                    .unwrap_or(prefix)
-            } else {
-                prefix
-            };
-            Cluster { slug, members }
-        })
-        .collect()
-}
-
-fn seed_prefix(path: &str) -> String {
-    let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
-    match parts.as_slice() {
-        [root, _rest @ ..] if matches!(*root, "crates" | "apps" | "packages" | "libs") => {
-            // Seed as one-per-package under those roots (second segment), not the whole crates/.
-            if parts.len() >= 2 {
-                parts[1].to_string()
-            } else {
-                root.to_string()
-            }
-        }
-        [first, ..] => (*first).to_string(),
-        [] => "subsystem".to_string(),
-    }
-}
-
-fn agglomerate(clusters: &mut Vec<Cluster>, graph: &SemanticGraph, config: ClusterConfig) {
-    let max = config.max_subsystems.max(1);
-    let min = config.min_subsystems.min(max).max(1);
-    let mut merge_counter = 0usize;
-
-    while clusters.len() > max {
-        if !merge_best_pair(clusters, graph, false, &mut merge_counter) {
-            merge_best_pair(clusters, graph, true, &mut merge_counter);
+    let mut prefix_groups: Vec<(String, Vec<NodeId>)> = Vec::new();
+    let mut leftovers: Vec<NodeId> = Vec::new();
+    for (prefix, members) in by_prefix {
+        if members.len() >= 2 && prefix != OTHER_SUBSYSTEM_SLUG {
+            prefix_groups.push((prefix, members));
+        } else {
+            leftovers.extend(members);
         }
     }
 
-    // Continue merging while above min and a positive-affinity pair exists.
-    while clusters.len() > min {
-        if !merge_best_pair(clusters, graph, false, &mut merge_counter) {
-            break;
-        }
-    }
+    // Keep largest prefix groups; fold the rest (and true singletons) into `other`.
+    prefix_groups.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
 
-    // Deduplicate / normalize empty.
-    clusters.retain(|cluster| !cluster.members.is_empty());
-}
-
-fn merge_best_pair(
-    clusters: &mut Vec<Cluster>,
-    graph: &SemanticGraph,
-    allow_zero: bool,
-    merge_counter: &mut usize,
-) -> bool {
-    if clusters.len() < 2 {
-        return false;
-    }
-
-    let mut best: Option<(usize, usize, f32)> = None;
-    for left in 0..clusters.len() {
-        for right in (left + 1)..clusters.len() {
-            let score = cluster_pair_affinity(graph, &clusters[left], &clusters[right]);
-            if !allow_zero && score <= 0.0 {
-                continue;
-            }
-            let replace = match best {
-                None => true,
-                Some((_, _, best_score)) => {
-                    score > best_score
-                        || (score == best_score
-                            && (left, right)
-                                < (best.map(|(a, b, _)| (a, b)).unwrap_or((left, right))))
-                }
-            };
-            if replace {
-                best = Some((left, right, score));
-            }
-        }
-    }
-
-    let Some((left, right, _)) = best else {
-        return false;
+    let other_needed = !leftovers.is_empty()
+        || prefix_groups.len() > max_unpinned_groups
+        || (prefix_groups.len() == max_unpinned_groups && !leftovers.is_empty());
+    let group_slots = if other_needed {
+        max_unpinned_groups.saturating_sub(1)
+    } else {
+        max_unpinned_groups
     };
 
-    let right_cluster = clusters.remove(right);
-    let left_cluster = &mut clusters[left];
-    left_cluster.members.extend(right_cluster.members);
-    left_cluster.slug = merged_slug(&left_cluster.slug.clone(), &right_cluster.slug, merge_counter);
-    true
-}
-
-fn merged_slug(left: &str, right: &str, merge_counter: &mut usize) -> String {
-    if left == right {
-        return left.to_string();
-    }
-    // Synthetic names use `subsystem-{n}`; never collapse those on the shared
-    // "subsystem" token (e.g. subsystem-19 + subsystem-18 must not become "subsystem").
-    if !is_synthetic_subsystem_slug(left) && !is_synthetic_subsystem_slug(right) {
-        let left_parts: Vec<_> = left.split(|c| c == '-' || c == '_').collect();
-        let right_parts: Vec<_> = right.split(|c| c == '-' || c == '_').collect();
-        if let (Some(a), Some(b)) = (left_parts.first(), right_parts.first()) {
-            if a == b && !a.is_empty() && *a != "subsystem" {
-                return (*a).to_string();
+    for (index, (slug, members)) in prefix_groups.into_iter().enumerate() {
+        if index < group_slots {
+            for module_id in members {
+                assignment.insert(module_id, slug.clone());
             }
+        } else {
+            leftovers.extend(members);
         }
     }
-    *merge_counter += 1;
-    format!("subsystem-{merge_counter}")
+
+    for module_id in leftovers {
+        assignment.insert(module_id, OTHER_SUBSYSTEM_SLUG.to_string());
+    }
 }
 
-fn is_synthetic_subsystem_slug(slug: &str) -> bool {
+fn package_prefix_root(name: &str, all_names: &BTreeSet<String>) -> String {
+    let mut best = name.to_string();
+    for candidate in all_names {
+        if candidate.len() < best.len()
+            && name.starts_with(candidate.as_str())
+            && name.as_bytes().get(candidate.len()) == Some(&b'_')
+        {
+            best = candidate.clone();
+        }
+    }
+    best
+}
+
+pub fn is_synthetic_subsystem_slug(slug: &str) -> bool {
     slug.strip_prefix("subsystem-")
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-}
-
-fn cluster_pair_affinity(graph: &SemanticGraph, left: &Cluster, right: &Cluster) -> f32 {
-    let mut score = 0.0;
-    for &from in &left.members {
-        for &to in &right.members {
-            if depends_either_way(graph, from, to) {
-                score += 1.0;
-            }
-        }
-    }
-    score
 }
 
 fn depends_either_way(graph: &SemanticGraph, a: NodeId, b: NodeId) -> bool {
@@ -494,7 +444,8 @@ mod tests {
     use worktree::WorktreeId;
 
     use super::{
-        cluster_subsystems, load_pin_config, merged_slug, ClusterConfig, PinConfig, PinnedSubsystem,
+        cluster_subsystems, is_synthetic_subsystem_slug, load_pin_config, ClusterConfig, PinConfig,
+        PinnedSubsystem, OTHER_SUBSYSTEM_SLUG,
     };
     use crate::{
         Edge, EdgeKind, GraphPatch, ModuleKind, ModulePayload, ModuleRef, Node, NodeFlags, NodeId,
@@ -605,20 +556,196 @@ subsystem = "agent"
         assert_eq!(pins.module_pins[0].subsystem, "agent");
     }
 
-    #[test]
-    fn merged_slug_does_not_collapse_synthetic_subsystem_names() {
-        let mut counter = 0usize;
-        let merged = merged_slug("subsystem-19", "subsystem-18", &mut counter);
-        assert_ne!(merged, "subsystem");
-        assert!(
-            merged.starts_with("subsystem-"),
-            "expected synthetic slug, got {merged}"
-        );
-        assert_eq!(counter, 1);
+    fn subsystem_members(graph: &SemanticGraph, slug: &str) -> Vec<NodeId> {
+        let subsystem_id = graph
+            .nodes
+            .values()
+            .find(|node| node.kind == NodeKind::Subsystem && node.display_name.as_ref() == slug)
+            .map(|node| node.id)
+            .unwrap_or_else(|| panic!("expected subsystem {slug}"));
+        graph
+            .edges
+            .values()
+            .filter(|edge| edge.kind == EdgeKind::Contains && edge.from == subsystem_id)
+            .map(|edge| edge.to)
+            .collect()
+    }
 
-        // Non-synthetic shared prefixes still collapse to the common token.
-        let shared = merged_slug("editor-core", "editor-ui", &mut counter);
-        assert_eq!(shared, "editor");
-        assert_eq!(counter, 1);
+    fn graph_with_modules(
+        names: &[&str],
+        deps: &[(&str, &str)],
+    ) -> (SemanticGraph, std::collections::HashMap<String, NodeId>) {
+        let worktree_id = WorktreeId::from_usize(1);
+        let project_key = NodeKey::Project { worktree_id };
+        let project_id = NodeId::from_key(&project_key);
+        let project = Node::project(project_id, project_key, "demo");
+
+        let mut modules = Vec::new();
+        let mut ids = std::collections::HashMap::new();
+        let mut contains = Vec::new();
+        for name in names {
+            let module = path_module(worktree_id, &format!("crates/{name}"), name);
+            contains.push(Edge::contains(project_id, module.id));
+            ids.insert((*name).to_string(), module.id);
+            modules.push(module);
+        }
+
+        let mut edges = contains;
+        for (from, to) in deps {
+            edges.push(Edge::depends_on(ids[*from], ids[*to]));
+        }
+
+        let mut upsert_nodes = vec![project];
+        upsert_nodes.extend(modules);
+
+        let mut graph = SemanticGraph::default();
+        graph
+            .apply_patch(GraphPatch {
+                base: graph.revision(),
+                removed_nodes: vec![],
+                removed_edges: vec![],
+                upsert_nodes,
+                upsert_edges: edges,
+            })
+            .unwrap();
+        (graph, ids)
+    }
+
+    fn cluster_and_apply(graph: &mut SemanticGraph, config: ClusterConfig, pins: &PinConfig) {
+        let patch = cluster_subsystems(graph, config, pins).unwrap();
+        graph.apply_patch(patch).unwrap();
+    }
+
+    fn subsystem_slugs(graph: &SemanticGraph) -> Vec<String> {
+        let mut slugs: Vec<String> = graph
+            .nodes
+            .values()
+            .filter(|node| node.kind == NodeKind::Subsystem)
+            .map(|node| node.display_name.to_string())
+            .collect();
+        slugs.sort();
+        slugs
+    }
+
+    #[test]
+    fn leftover_modules_go_to_other_not_singletons_or_mega_blob() {
+        // Dense DependsOn mesh used to agglomerate into subsystem-N plus
+        // leftover crate-named singletons. Pins first; leftovers → other.
+        let (mut graph, ids) = graph_with_modules(
+            &["gpui", "editor", "project", "agent", "which_key", "ztracing"],
+            &[
+                ("editor", "gpui"),
+                ("project", "gpui"),
+                ("agent", "gpui"),
+                ("editor", "project"),
+                ("agent", "editor"),
+            ],
+        );
+        let pins = PinConfig {
+            subsystems: vec![PinnedSubsystem {
+                slug: "editing".into(),
+                members: vec!["crates/editor".into()],
+                summary: Some("Editor".into()),
+            }],
+            module_pins: vec![],
+        };
+
+        cluster_and_apply(
+            &mut graph,
+            ClusterConfig {
+                min_subsystems: 3,
+                max_subsystems: 4,
+            },
+            &pins,
+        );
+
+        let slugs = subsystem_slugs(&graph);
+        assert!(
+            slugs.iter().all(|slug| !is_synthetic_subsystem_slug(slug)),
+            "affinity merge must not emit subsystem-N, got {slugs:?}"
+        );
+        assert!(slugs.contains(&"editing".to_string()), "{slugs:?}");
+        assert!(
+            slugs.contains(&OTHER_SUBSYSTEM_SLUG.to_string()),
+            "unlisted crates should share {OTHER_SUBSYSTEM_SLUG}, got {slugs:?}"
+        );
+
+        let editing = subsystem_members(&graph, "editing");
+        assert_eq!(editing, vec![ids["editor"]]);
+
+        let other = subsystem_members(&graph, OTHER_SUBSYSTEM_SLUG);
+        for name in ["gpui", "project", "agent", "which_key", "ztracing"] {
+            assert!(
+                other.contains(&ids[name]),
+                "{name} should be in other, not a singleton subsystem"
+            );
+        }
+        assert_eq!(other.len(), 5);
+    }
+
+    #[test]
+    fn unpinned_modules_group_by_package_name_prefix() {
+        let (mut graph, ids) = graph_with_modules(
+            &["gpui", "gpui_macros", "gpui_util", "editor", "which_key"],
+            &[("gpui_macros", "gpui"), ("editor", "gpui")],
+        );
+        cluster_and_apply(&mut graph, ClusterConfig::default(), &PinConfig::default());
+
+        let slugs = subsystem_slugs(&graph);
+        assert!(
+            slugs.iter().all(|slug| !is_synthetic_subsystem_slug(slug)),
+            "got {slugs:?}"
+        );
+        assert!(slugs.contains(&"gpui".to_string()), "{slugs:?}");
+        assert!(slugs.contains(&OTHER_SUBSYSTEM_SLUG.to_string()), "{slugs:?}");
+
+        let gpui_members = subsystem_members(&graph, "gpui");
+        assert!(gpui_members.contains(&ids["gpui"]));
+        assert!(gpui_members.contains(&ids["gpui_macros"]));
+        assert!(gpui_members.contains(&ids["gpui_util"]));
+
+        let other = subsystem_members(&graph, OTHER_SUBSYSTEM_SLUG);
+        assert!(other.contains(&ids["editor"]));
+        assert!(other.contains(&ids["which_key"]));
+        assert!(!other.contains(&ids["gpui"]));
+    }
+
+    #[test]
+    fn extra_prefix_groups_fold_into_other_when_over_max() {
+        let (mut graph, ids) = graph_with_modules(
+            &[
+                "gpui",
+                "gpui_macros",
+                "agent",
+                "agent_ui",
+                "git",
+                "git_ui",
+                "solo",
+            ],
+            &[],
+        );
+        cluster_and_apply(
+            &mut graph,
+            ClusterConfig {
+                min_subsystems: 1,
+                max_subsystems: 2,
+            },
+            &PinConfig::default(),
+        );
+
+        let slugs = subsystem_slugs(&graph);
+        assert!(
+            slugs.iter().all(|slug| !is_synthetic_subsystem_slug(slug)),
+            "got {slugs:?}"
+        );
+        assert!(slugs.len() <= 2, "expected ≤ max_subsystems, got {slugs:?}");
+        assert!(
+            slugs.contains(&OTHER_SUBSYSTEM_SLUG.to_string()),
+            "overflow prefix groups must fold into other, got {slugs:?}"
+        );
+        assert!(
+            subsystem_members(&graph, OTHER_SUBSYSTEM_SLUG).contains(&ids["solo"]),
+            "true singletons belong in other"
+        );
     }
 }

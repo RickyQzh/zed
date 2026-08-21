@@ -173,7 +173,9 @@ fn apply_patch_with_budget(
 
 /// Drop lowest-priority nodes until `graph.nodes.len() <= max_auto_nodes`.
 ///
-/// Retention priority: Project → Subsystem → Module → Entry → Type → External.
+/// Retention priority: Project → Subsystem → Module → Type → Entry → External.
+/// Entry and External are dropped before Module/Subsystem so a tight cap keeps
+/// the crate map rather than lib/bin entry nodes.
 /// Returns `true` when any nodes were removed.
 pub fn enforce_max_auto_nodes(
     graph: &mut SemanticGraph,
@@ -226,8 +228,8 @@ fn node_kind_budget_rank(kind: NodeKind) -> u8 {
         NodeKind::Project => 0,
         NodeKind::Subsystem => 1,
         NodeKind::Module => 2,
-        NodeKind::Entry => 3,
-        NodeKind::Type => 4,
+        NodeKind::Type => 3,
+        NodeKind::Entry => 4,
         NodeKind::External => 5,
     }
 }
@@ -342,9 +344,17 @@ mod tests {
 
     use worktree::WorktreeId;
 
-    use super::{build_initial_graph, BuildGraphOptions, GraphIndexer};
+    use std::sync::Arc;
+
+    use util::rel_path::RelPath;
+
+    use super::{build_initial_graph, enforce_max_auto_nodes, BuildGraphOptions, GraphIndexer};
     use crate::intent::StaticIntentProvider;
-    use crate::{EdgeKind, NodeKind};
+    use crate::{
+        Edge, EdgeKind, EcosystemKind, EntryKind, ExternalPayload, GraphPatch, IntentIndex, ModuleKind,
+        ModulePayload, ModuleRef, Node, NodeFlags, NodeId, NodeKey, NodeKind, NodePayload,
+        SemanticGraph, SubsystemPayload, SymbolKey, SymbolKind,
+    };
 
     fn build_opts(max_auto_nodes: usize, intent_llm: bool) -> BuildGraphOptions {
         BuildGraphOptions {
@@ -492,5 +502,180 @@ mod tests {
             assert!(matches!(on.source, crate::IntentSource::Static));
         }
         let _ = graph;
+    }
+
+    #[test]
+    fn enforce_max_auto_nodes_drops_entries_and_externals_before_modules() {
+        let worktree_id = WorktreeId::from_usize(1);
+        let project_key = NodeKey::Project { worktree_id };
+        let project_id = NodeId::from_key(&project_key);
+
+        let subsystem_key = NodeKey::Subsystem {
+            project: project_key.clone().into(),
+            slug: "core".into(),
+        };
+        let subsystem_id = NodeId::from_key(&subsystem_key);
+
+        let module_key = NodeKey::Module {
+            worktree_id,
+            module_ref: ModuleRef::CargoPackage {
+                package_name: "editor".into(),
+                manifest_dir: Arc::from(RelPath::from_unix_str("crates/editor").unwrap()),
+            },
+        };
+        let module_id = NodeId::from_key(&module_key);
+        let module_key_ref = crate::NodeKeyRef::from(module_key.clone());
+
+        let entry_key = NodeKey::Entry {
+            module: module_key_ref.clone(),
+            symbol_key: SymbolKey {
+                qualified_name: "lib".into(),
+                kind: SymbolKind::Module,
+            },
+        };
+        let entry_id = NodeId::from_key(&entry_key);
+
+        let external_key = NodeKey::External {
+            ecosystem: EcosystemKind::Cargo,
+            name: "serde".into(),
+            version_req: None,
+        };
+        let external_id = NodeId::from_key(&external_key);
+
+        let mut graph = SemanticGraph::default();
+        graph
+            .apply_patch(GraphPatch {
+                base: graph.revision(),
+                removed_nodes: vec![],
+                removed_edges: vec![],
+                upsert_nodes: vec![
+                    Node::project(project_id, project_key, "demo"),
+                    Node::subsystem(
+                        subsystem_id,
+                        subsystem_key,
+                        "core",
+                        SubsystemPayload {
+                            member_count: 1,
+                            cluster_score: 1.0,
+                            pinned: false,
+                        },
+                        NodeFlags::default(),
+                    ),
+                    Node::module(
+                        module_id,
+                        module_key,
+                        "editor",
+                        None,
+                        ModulePayload {
+                            language: Some("rust".into()),
+                            module_kind: ModuleKind::CrateLib,
+                            public_exports: Vec::new(),
+                            deps_out_count: 0,
+                            deps_in_count: 0,
+                            loc_estimate: None,
+                        },
+                        NodeFlags::default(),
+                    ),
+                    Node::entry(
+                        entry_id,
+                        entry_key,
+                        "lib",
+                        None,
+                        EntryKind::LibRoot,
+                        NodeFlags::default(),
+                    ),
+                    Node {
+                        id: external_id,
+                        key: external_key,
+                        kind: NodeKind::External,
+                        display_name: "serde".into(),
+                        abbrev: None,
+                        location: None,
+                        payload: NodePayload::External(ExternalPayload {
+                            ecosystem: EcosystemKind::Cargo,
+                        }),
+                        flags: NodeFlags {
+                            is_external: true,
+                            ..NodeFlags::default()
+                        },
+                    },
+                ],
+                upsert_edges: vec![
+                    Edge::contains(project_id, subsystem_id),
+                    Edge::contains(subsystem_id, module_id),
+                    Edge::contains(module_id, entry_id),
+                    Edge::depends_on(module_id, external_id),
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(graph.nodes.len(), 5);
+        let mut intents = IntentIndex::default();
+        let truncated = enforce_max_auto_nodes(&mut graph, &mut intents, 3).unwrap();
+        assert!(truncated);
+        assert_eq!(graph.nodes.len(), 3);
+        let kinds: std::collections::BTreeSet<_> =
+            graph.nodes.values().map(|node| node.kind).collect();
+        assert!(kinds.contains(&NodeKind::Project));
+        assert!(kinds.contains(&NodeKind::Subsystem));
+        assert!(kinds.contains(&NodeKind::Module));
+        assert!(
+            !kinds.contains(&NodeKind::Entry),
+            "Entries must be dropped before Modules when the cap is tight, kept {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&NodeKind::External),
+            "Externals must be dropped before Modules when the cap is tight, kept {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn build_initial_graph_small_max_drops_entries_before_crate_modules() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
+        let (full, _, _) =
+            build_initial_graph(&root, WorktreeId::from_usize(1), build_opts(usize::MAX, false))
+                .unwrap();
+        let crate_map_count = full
+            .nodes
+            .values()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    NodeKind::Project | NodeKind::Subsystem | NodeKind::Module
+                )
+            })
+            .count();
+        assert!(
+            full.nodes.values().any(|node| node.kind == NodeKind::Entry),
+            "fixture should emit Entry nodes so the trim can drop them"
+        );
+
+        let (graph, _intents, truncated) = build_initial_graph(
+            &root,
+            WorktreeId::from_usize(1),
+            build_opts(crate_map_count, false),
+        )
+        .unwrap();
+        assert!(truncated);
+        assert!(graph.nodes.len() <= crate_map_count);
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.kind == NodeKind::Module && node.display_name.as_ref() == "core_lib"),
+            "crate Modules must survive a cap that fits Project+Subsystem+Module only"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.kind != NodeKind::Entry && node.kind != NodeKind::External),
+            "Entries/Externals must be dropped first; leftover kinds: {:?}",
+            graph
+                .nodes
+                .values()
+                .map(|node| node.kind)
+                .collect::<Vec<_>>()
+        );
     }
 }

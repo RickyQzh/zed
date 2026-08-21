@@ -1,0 +1,135 @@
+# Product-area pins for Semantic Map Phase A dogfood on this checkout.
+# Only `crates/<package>` paths that exist as workspace members are listed.
+# Unlisted crates are clustered into `other` (or a few package-name prefix groups).
+
+[subsystems.gpui-ui]
+members = [
+    "crates/gpui",
+    "crates/gpui_linux",
+    "crates/gpui_macos",
+    "crates/gpui_macros",
+    "crates/gpui_platform",
+    "crates/gpui_shared_string",
+    "crates/gpui_tokio",
+    "crates/gpui_util",
+    "crates/gpui_web",
+    "crates/gpui_wgpu",
+    "crates/gpui_windows",
+    "crates/ui",
+    "crates/ui_input",
+    "crates/ui_macros",
+    "crates/ui_prompt",
+    "crates/theme",
+    "crates/theme_extension",
+    "crates/theme_importer",
+    "crates/theme_selector",
+    "crates/theme_settings",
+    "crates/syntax_theme",
+    "crates/icons",
+]
+summary = "GPU-accelerated UI framework, components, and theming"
+
+[subsystems.editing]
+members = [
+    "crates/editor",
+    "crates/editor_benchmarks",
+    "crates/multi_buffer",
+    "crates/language",
+    "crates/language_core",
+    "crates/language_extension",
+    "crates/language_onboarding",
+    "crates/language_selector",
+    "crates/language_tools",
+    "crates/languages",
+    "crates/text",
+    "crates/rope",
+    "crates/sum_tree",
+]
+summary = "Text editor, buffers, languages, and syntax"
+
+[subsystems.project-services]
+members = [
+    "crates/project",
+    "crates/project_benchmarks",
+    "crates/project_panel",
+    "crates/project_symbols",
+    "crates/lsp",
+    "crates/lsp_locations",
+    "crates/worktree",
+    "crates/worktree_benchmarks",
+    "crates/fs",
+    "crates/fs_benchmarks",
+    "crates/settings",
+    "crates/settings_content",
+    "crates/settings_json",
+    "crates/settings_macros",
+    "crates/settings_profile_selector",
+    "crates/settings_ui",
+]
+summary = "Project model, worktrees, LSP, filesystem, and settings"
+
+[subsystems.agent]
+members = [
+    "crates/agent",
+    "crates/agent_ui",
+    "crates/agent_servers",
+    "crates/agent_skills",
+    "crates/agent_settings",
+    "crates/edit_prediction",
+    "crates/edit_prediction_cli",
+    "crates/edit_prediction_context",
+    "crates/edit_prediction_metrics",
+    "crates/edit_prediction_types",
+    "crates/edit_prediction_ui",
+    "crates/language_model",
+    "crates/language_model_core",
+    "crates/language_models",
+    "crates/language_models_cloud",
+]
+summary = "Agent, edit prediction, and language model integration"
+
+[subsystems.collab]
+members = [
+    "crates/collab",
+    "crates/collab_ui",
+    "crates/client",
+    "crates/rpc",
+    "crates/proto",
+    "crates/call",
+    "crates/channel",
+]
+summary = "Multiplayer collaboration, RPC, and Zed server"
+
+[subsystems.git]
+members = [
+    "crates/git",
+    "crates/git_ui",
+    "crates/git_ui_core",
+    "crates/git_hosting_providers",
+]
+summary = "Git status, UI, and hosting providers"
+
+[subsystems.app]
+members = [
+    "crates/zed",
+    "crates/zed_actions",
+    "crates/zed_credentials_provider",
+    "crates/zed_env_vars",
+    "crates/cli",
+    "crates/assets",
+]
+summary = "Zed application binary, actions, CLI, and assets"
+
+[subsystems.debugger]
+members = [
+    "crates/dap",
+    "crates/dap_adapters",
+    "crates/debugger_ui",
+    "crates/debugger_tools",
+    "crates/debug_adapter_extension",
+]
+summary = "Debug adapter protocol and debugger UI"
+
+[subsystems.other]
+members = []
+summary = "Workspace crates not pinned to a product area"
