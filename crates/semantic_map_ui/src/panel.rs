@@ -1,12 +1,14 @@
 use std::ops::Range;
+use std::path::Path;
+use std::time::Duration;
 
 use gpui::{
     Action, App, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
-    Styled, Subscription, UniformListScrollHandle, WeakEntity, Window, actions, div, px,
+    Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, div, px,
     uniform_list,
 };
-use project::{Project, ProjectPath};
+use project::{PathChange, Project, ProjectPath, worktree_store::WorktreeStoreEvent};
 use semantic_graph::{Lens, NodeId, SemanticGraphEvent, SourceLocation};
 use settings::{Settings, SettingsStore};
 use ui::{Chip, Color, Label, LabelSize, ListItem, Tooltip, prelude::*};
@@ -16,9 +18,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::{
-    PanelRow, PanelStatus, PanelViewModel, SemanticMapSelection, SemanticMapSettings,
-};
+use crate::{PanelRow, PanelStatus, PanelViewModel, SemanticMapSelection, SemanticMapSettings};
 
 actions!(
     semantic_map,
@@ -37,6 +37,8 @@ actions!(
 const PANEL_KEY: &str = "SemanticMapPanel";
 const DEFAULT_WIDTH: Pixels = px(260.);
 const INTENT_TRUNCATE_CHARS: usize = 72;
+const REINDEX_DEBOUNCE: Duration = Duration::from_millis(500);
+const IGNORED_PATH_COMPONENTS: &[&str] = &["target", ".git", "node_modules"];
 
 pub struct SemanticMapPanel {
     project: Entity<Project>,
@@ -46,6 +48,8 @@ pub struct SemanticMapPanel {
     view_model: PanelViewModel,
     position: DockPosition,
     has_reindexed: bool,
+    enabled: bool,
+    reindex_debounce_task: Option<Task<()>>,
     scroll_handle: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -74,23 +78,26 @@ impl SemanticMapPanel {
             let semantic_graph = project.read(cx).semantic_graph().clone();
 
             let mut subscriptions = Vec::new();
-            subscriptions.push(cx.subscribe(
-                &semantic_graph,
-                |this: &mut Self, _, event, cx| {
+            subscriptions.push(
+                cx.subscribe(&semantic_graph, |this: &mut Self, _, event, cx| {
                     if matches!(event, SemanticGraphEvent::Updated { .. }) {
                         this.refresh_view_model(cx);
                     }
-                },
-            ));
+                }),
+            );
             // Status moves to Indexing/Error via notify without always emitting Updated.
             subscriptions.push(cx.observe(&semantic_graph, |this, _, cx| {
                 this.refresh_view_model(cx);
             }));
             subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
-                this.refresh_view_model(cx);
-                cx.notify();
+                this.on_settings_changed(cx);
+            }));
+            let worktree_store = project.read(cx).worktree_store();
+            subscriptions.push(cx.subscribe(&worktree_store, |this, _, event, cx| {
+                this.on_worktree_store_event(event, cx);
             }));
 
+            let enabled = SemanticMapSettings::get_global(cx).enabled;
             let mut this = Self {
                 project: project.clone(),
                 workspace: workspace_handle,
@@ -99,12 +106,14 @@ impl SemanticMapPanel {
                 view_model: PanelViewModel::default(),
                 position: DockPosition::Left,
                 has_reindexed: false,
+                enabled,
+                reindex_debounce_task: None,
                 scroll_handle: UniformListScrollHandle::new(),
                 _subscriptions: subscriptions,
             };
 
             this.refresh_view_model(cx);
-            if SemanticMapSettings::get_global(cx).enabled {
+            if enabled {
                 this.ensure_indexed(cx);
             }
 
@@ -169,9 +178,58 @@ impl SemanticMapPanel {
         if self.has_reindexed {
             return;
         }
+        self.start_reindex(cx);
+    }
+
+    fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
+        let enabled = SemanticMapSettings::get_global(cx).enabled;
+        let was_enabled = self.enabled;
+        self.enabled = enabled;
+        self.refresh_view_model(cx);
+        if !enabled {
+            self.reindex_debounce_task.take();
+        } else if !was_enabled {
+            self.start_reindex(cx);
+        }
+        cx.notify();
+    }
+
+    fn on_worktree_store_event(&mut self, event: &WorktreeStoreEvent, cx: &mut Context<Self>) {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
         }
+        let should_reindex = match event {
+            WorktreeStoreEvent::WorktreeUpdatedEntries(_, changes) => {
+                changes.iter().any(|(path, _, change)| {
+                    should_reindex_worktree_change(path.as_std_path(), *change)
+                })
+            }
+            WorktreeStoreEvent::WorktreeAdded(_) => true,
+            _ => false,
+        };
+        if should_reindex {
+            self.schedule_reindex(cx);
+        }
+    }
+
+    fn schedule_reindex(&mut self, cx: &mut Context<Self>) {
+        if !SemanticMapSettings::get_global(cx).enabled {
+            return;
+        }
+        self.reindex_debounce_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REINDEX_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.start_reindex(cx);
+            })
+            .log_err();
+        }));
+    }
+
+    fn start_reindex(&mut self, cx: &mut Context<Self>) {
+        if !SemanticMapSettings::get_global(cx).enabled {
+            return;
+        }
+        self.reindex_debounce_task.take();
         let options = Self::build_options_from_settings(SemanticMapSettings::get_global(cx));
         self.project.update(cx, |project, cx| {
             project.reindex_semantic_graph(options, cx);
@@ -179,7 +237,9 @@ impl SemanticMapPanel {
         self.has_reindexed = true;
     }
 
-    fn build_options_from_settings(settings: &SemanticMapSettings) -> semantic_graph::BuildGraphOptions {
+    fn build_options_from_settings(
+        settings: &SemanticMapSettings,
+    ) -> semantic_graph::BuildGraphOptions {
         semantic_graph::BuildGraphOptions {
             max_auto_nodes: settings.max_auto_nodes,
             module_depth: settings.module_depth as u32,
@@ -198,12 +258,7 @@ impl SemanticMapPanel {
         cx.notify();
     }
 
-    fn open_node_source(
-        &self,
-        node_id: NodeId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_node_source(&self, node_id: NodeId, window: &mut Window, cx: &mut Context<Self>) {
         open_node_source(&self.workspace, &self.project, node_id, window, cx);
     }
 
@@ -220,14 +275,7 @@ impl SemanticMapPanel {
     }
 
     fn reindex(&mut self, _: &Reindex, _window: &mut Window, cx: &mut Context<Self>) {
-        if !SemanticMapSettings::get_global(cx).enabled {
-            return;
-        }
-        let options = Self::build_options_from_settings(SemanticMapSettings::get_global(cx));
-        self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(options, cx);
-        });
-        self.has_reindexed = true;
+        self.start_reindex(cx);
     }
 
     fn render_row(
@@ -244,39 +292,41 @@ impl SemanticMapPanel {
             .as_ref()
             .map(|summary| truncate_intent(summary));
 
-        ListItem::new(ElementId::Name(format!("semantic-map-row-{node_id:?}").into()))
-            .selectable(true)
-            .toggle_state(selected)
-            .indent_level(row.depth as usize)
-            .indent_step_size(px(12.))
-            .on_click({
-                let panel = cx.weak_entity();
-                move |event: &ClickEvent, window, cx| {
-                    panel
-                        .update(cx, |this, cx| {
-                            this.select_node(node_id, cx);
-                            if event.click_count() > 1 {
-                                this.open_node_source(node_id, window, cx);
-                            }
-                        })
-                        .log_err();
-                }
-            })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .min_w_0()
-                    .child(Label::new(name).size(LabelSize::Small))
-                    .when_some(intent, |this, intent| {
-                        this.child(
-                            Label::new(intent)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    }),
-            )
+        ListItem::new(ElementId::Name(
+            format!("semantic-map-row-{node_id:?}").into(),
+        ))
+        .selectable(true)
+        .toggle_state(selected)
+        .indent_level(row.depth as usize)
+        .indent_step_size(px(12.))
+        .on_click({
+            let panel = cx.weak_entity();
+            move |event: &ClickEvent, window, cx| {
+                panel
+                    .update(cx, |this, cx| {
+                        this.select_node(node_id, cx);
+                        if event.click_count() > 1 {
+                            this.open_node_source(node_id, window, cx);
+                        }
+                    })
+                    .log_err();
+            }
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .min_w_0()
+                .child(Label::new(name).size(LabelSize::Small))
+                .when_some(intent, |this, intent| {
+                    this.child(
+                        Label::new(intent)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                }),
+        )
     }
 }
 
@@ -312,6 +362,73 @@ fn status_chip(status: &PanelStatus) -> Chip {
 /// Empty-state copy is only for a Ready panel with no rows — not Indexing/Partial/Error.
 fn shows_empty_nodes_copy(enabled: bool, row_count: usize, status: &PanelStatus) -> bool {
     enabled && row_count == 0 && matches!(status, PanelStatus::Ready)
+}
+
+fn path_has_ignored_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| IGNORED_PATH_COMPONENTS.contains(&name))
+    })
+}
+
+fn is_rust_under_src(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "src")
+}
+
+fn is_crate_root_readme(path: &Path) -> bool {
+    let is_readme = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("README.md"));
+    if !is_readme {
+        return false;
+    }
+    match path.parent() {
+        None => true,
+        Some(parent) if parent.as_os_str().is_empty() => true,
+        Some(parent) => !parent.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("src" | "target" | "tests" | ".git")
+            )
+        }),
+    }
+}
+
+/// Returns whether a changed path should trigger a semantic-graph rebuild.
+fn should_reindex_path(path: &Path) -> bool {
+    if path_has_ignored_component(path) {
+        return false;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name.eq_ignore_ascii_case("Cargo.toml")
+        || file_name.eq_ignore_ascii_case("semantic_map.toml")
+        || file_name.eq_ignore_ascii_case("build.rs")
+    {
+        return true;
+    }
+    if is_crate_root_readme(path) || is_rust_under_src(path) {
+        return true;
+    }
+
+    // Added/removed directories typically have no extension.
+    !file_name.is_empty() && path.extension().is_none()
+}
+
+fn should_reindex_worktree_change(path: &Path, change: PathChange) -> bool {
+    if matches!(change, PathChange::Loaded) {
+        return false;
+    }
+    should_reindex_path(path)
 }
 
 fn project_path_from_source_location(location: &SourceLocation) -> ProjectPath {
@@ -435,13 +552,11 @@ impl Render for SemanticMapPanel {
             .on_action(cx.listener(Self::reindex))
             .when(!enabled, |this| {
                 this.child(
-                    div()
-                        .p_3()
-                        .child(
-                            Label::new("Enable semantic_map in settings to use this panel.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
+                    div().p_3().child(
+                        Label::new("Enable semantic_map in settings to use this panel.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
                 )
             })
             .when(enabled, |this| {
@@ -513,7 +628,11 @@ impl Render for SemanticMapPanel {
     }
 }
 
-pub fn register_panel_actions(workspace: &mut Workspace, _: Option<&mut Window>, _: &mut Context<Workspace>) {
+pub fn register_panel_actions(
+    workspace: &mut Workspace,
+    _: Option<&mut Window>,
+    _: &mut Context<Workspace>,
+) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         if !SemanticMapSettings::get_global(cx).enabled {
             return;
@@ -572,6 +691,62 @@ mod tests {
         });
     }
 
+    fn enable_semantic_map(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.semantic_map.get_or_insert_default().enabled = Some(true);
+                });
+            });
+        });
+    }
+
+    fn graph_has_node(project: &Entity<Project>, node_id: NodeId, cx: &TestAppContext) -> bool {
+        project.read_with(cx, |project, cx| {
+            project
+                .semantic_graph()
+                .read(cx)
+                .snapshot()
+                .graph
+                .nodes
+                .contains_key(&node_id)
+        })
+    }
+
+    fn apply_stub_graph(
+        project: &Entity<Project>,
+        snapshot: &SemanticGraphSnapshot,
+        cx: &mut TestAppContext,
+    ) {
+        project.update(cx, |project, cx| {
+            project.semantic_graph().update(cx, |store, cx| {
+                store.replace_graph((*snapshot.graph).clone(), (*snapshot.intents).clone(), cx);
+            });
+        });
+    }
+
+    async fn test_project_and_panel(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Entity<SemanticMapPanel>) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "src": { "lib.rs": "" } }))
+            .await;
+        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let panel = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    SemanticMapPanel::new(workspace, window, cx)
+                })
+            })
+            .unwrap();
+        (project, panel)
+    }
+
     fn stub_snapshot() -> (SemanticGraphSnapshot, NodeId, NodeId) {
         let worktree_id = WorktreeId::from_usize(1);
         let project_key = NodeKey::Project { worktree_id };
@@ -627,15 +802,12 @@ mod tests {
         let (snapshot, project_id, subsystem_id) = stub_snapshot();
         project.update(cx, |project, cx| {
             project.semantic_graph().update(cx, |store, cx| {
-                store.replace_graph(
-                    (*snapshot.graph).clone(),
-                    (*snapshot.intents).clone(),
-                    cx,
-                );
+                store.replace_graph((*snapshot.graph).clone(), (*snapshot.intents).clone(), cx);
             });
         });
 
-        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = window
             .read_with(cx, |mw, _| mw.workspace().clone())
             .unwrap();
@@ -649,19 +821,16 @@ mod tests {
             })
             .unwrap();
 
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings
-                        .semantic_map
-                        .get_or_insert_default()
-                        .enabled = Some(true);
-                });
-            });
-        });
+        enable_semantic_map(cx);
+        apply_stub_graph(&project, &snapshot, cx);
 
         panel.read_with(cx, |panel, _| {
-            let ids: Vec<_> = panel.view_model().rows.iter().map(|row| row.node_id).collect();
+            let ids: Vec<_> = panel
+                .view_model()
+                .rows
+                .iter()
+                .map(|row| row.node_id)
+                .collect();
             assert_eq!(ids, vec![project_id, subsystem_id]);
             assert_eq!(panel.view_model().rows[0].kind, NodeKind::Project);
             assert_eq!(panel.view_model().rows[1].kind, NodeKind::Subsystem);
@@ -716,5 +885,136 @@ mod tests {
         let project_path = project_path_from_source_location(&location);
         assert_eq!(project_path.worktree_id, worktree_id);
         assert_eq!(project_path.path.as_ref(), location.path.as_ref());
+    }
+
+    #[test]
+    fn should_reindex_path_classifies_structural_changes() {
+        use std::path::Path;
+
+        assert!(should_reindex_path(Path::new("Cargo.toml")));
+        assert!(should_reindex_path(Path::new("crates/foo/Cargo.toml")));
+        assert!(should_reindex_path(Path::new("semantic_map.toml")));
+        assert!(should_reindex_path(Path::new(
+            "crates/foo/semantic_map.toml"
+        )));
+        assert!(should_reindex_path(Path::new("build.rs")));
+        assert!(should_reindex_path(Path::new("src/lib.rs")));
+        assert!(should_reindex_path(Path::new("crates/foo/src/main.rs")));
+        assert!(should_reindex_path(Path::new("README.md")));
+        assert!(should_reindex_path(Path::new("crates/foo/README.md")));
+        assert!(should_reindex_path(Path::new("src")));
+        assert!(should_reindex_path(Path::new("crates/new_crate")));
+
+        assert!(!should_reindex_path(Path::new("notes.md")));
+        assert!(!should_reindex_path(Path::new("src/README.md")));
+        assert!(!should_reindex_path(Path::new("docs/guide.md")));
+        assert!(!should_reindex_path(Path::new("tests/it.rs")));
+        assert!(!should_reindex_path(Path::new("target/debug")));
+        assert!(!should_reindex_path(Path::new("target/foo.rs")));
+        assert!(!should_reindex_path(Path::new(".git/config")));
+        assert!(!should_reindex_path(Path::new(
+            "node_modules/pkg/src/lib.rs"
+        )));
+    }
+
+    #[test]
+    fn should_reindex_worktree_change_skips_initial_scan() {
+        use std::path::Path;
+
+        assert!(!should_reindex_worktree_change(
+            Path::new("Cargo.toml"),
+            PathChange::Loaded
+        ));
+        assert!(should_reindex_worktree_change(
+            Path::new("Cargo.toml"),
+            PathChange::Updated
+        ));
+        assert!(should_reindex_worktree_change(
+            Path::new("src/lib.rs"),
+            PathChange::Added
+        ));
+        assert!(!should_reindex_worktree_change(
+            Path::new("src/lib.rs"),
+            PathChange::Loaded
+        ));
+        assert!(!should_reindex_worktree_change(
+            Path::new("notes.md"),
+            PathChange::Updated
+        ));
+    }
+
+    #[gpui::test]
+    async fn enabling_settings_triggers_index(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_project, panel) = test_project_and_panel(cx).await;
+
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.has_reindexed);
+            assert!(!panel.enabled);
+        });
+
+        enable_semantic_map(cx);
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.enabled);
+            assert!(panel.has_reindexed);
+        });
+    }
+
+    #[gpui::test]
+    async fn schedule_reindex_is_a_no_op_when_disabled(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_project, panel) = test_project_and_panel(cx).await;
+
+        panel.update(cx, |panel, cx| {
+            panel.schedule_reindex(cx);
+            assert!(panel.reindex_debounce_task.is_none());
+            assert!(!panel.has_reindexed);
+        });
+    }
+
+    #[gpui::test]
+    async fn schedule_reindex_debounces_and_cancels_prior_task(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (project, panel) = test_project_and_panel(cx).await;
+        enable_semantic_map(cx);
+        cx.run_until_parked();
+
+        let (snapshot, _, subsystem_id) = stub_snapshot();
+        apply_stub_graph(&project, &snapshot, cx);
+
+        panel.update(cx, |panel, cx| {
+            panel.schedule_reindex(cx);
+            assert!(panel.reindex_debounce_task.is_some());
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(200));
+        assert!(
+            graph_has_node(&project, subsystem_id, cx),
+            "debounce should not rebuild after 200ms"
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel.schedule_reindex(cx);
+            assert!(panel.reindex_debounce_task.is_some());
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(400));
+        assert!(
+            graph_has_node(&project, subsystem_id, cx),
+            "second schedule should reset the debounce window"
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.reindex_debounce_task.is_none());
+            assert!(panel.has_reindexed);
+        });
+        assert!(
+            !graph_has_node(&project, subsystem_id, cx),
+            "debounced reindex should replace the stub graph"
+        );
     }
 }
