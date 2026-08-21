@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use gpui::{Bounds, Point, SharedString, point, size};
 use semantic_graph::{
     CanvasPins, EdgeId, EdgeKind, IntentIndex, Lens, Node, NodeId, NodeKind, SemanticGraph,
@@ -153,6 +155,8 @@ impl CanvasViewModel {
         });
 
         let mut edges = Vec::new();
+        let nodes_by_id: HashMap<NodeId, &SceneNode> =
+            nodes.iter().map(|node| (node.id, node)).collect();
         for edge in snapshot.graph.edges.values() {
             if edge.kind != EdgeKind::DependsOn {
                 continue;
@@ -160,10 +164,10 @@ impl CanvasViewModel {
             if !lens.edge_kinds.contains(&edge.kind) {
                 continue;
             }
-            let Some(from_node) = nodes.iter().find(|node| node.id == edge.from) else {
+            let Some(from_node) = nodes_by_id.get(&edge.from) else {
                 continue;
             };
-            let Some(to_node) = nodes.iter().find(|node| node.id == edge.to) else {
+            let Some(to_node) = nodes_by_id.get(&edge.to) else {
                 continue;
             };
             let from_center = point(

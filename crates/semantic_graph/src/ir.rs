@@ -506,6 +506,10 @@ impl SemanticGraph {
             self.edges.insert(edge.id, edge);
         }
 
+        self.edges.retain(|_, edge| {
+            self.nodes.contains_key(&edge.from) && self.nodes.contains_key(&edge.to)
+        });
+
         self.rebuild_indexes();
         self.revision = self.revision.next();
         Ok(())
@@ -541,6 +545,7 @@ impl SemanticGraph {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use util::rel_path::RelPath;
     use worktree::WorktreeId;
 
     use super::*;
@@ -573,5 +578,72 @@ mod tests {
             })
             .unwrap();
         assert!(graph.nodes.is_empty());
+    }
+
+    #[test]
+    fn graph_patch_remove_node_drops_incident_edges() {
+        let mut graph = SemanticGraph::default();
+        let worktree_id = WorktreeId::from_usize(1);
+        let project_key = NodeKey::Project { worktree_id };
+        let project_id = NodeId::from_key(&project_key);
+        let child_key = NodeKey::Module {
+            worktree_id,
+            module_ref: ModuleRef::PathModule {
+                path: RelPath::empty_arc(),
+            },
+        };
+        let child_id = NodeId::from_key(&child_key);
+        let contains = Edge::contains(project_id, child_id);
+
+        graph
+            .apply_patch(GraphPatch {
+                base: graph.revision(),
+                removed_nodes: vec![],
+                removed_edges: vec![],
+                upsert_nodes: vec![
+                    Node::project(project_id, project_key, "demo"),
+                    Node::module(
+                        child_id,
+                        child_key,
+                        "child",
+                        None,
+                        ModulePayload {
+                            language: None,
+                            module_kind: ModuleKind::Folder,
+                            public_exports: Vec::new(),
+                            deps_out_count: 0,
+                            deps_in_count: 0,
+                            loc_estimate: None,
+                        },
+                        NodeFlags::default(),
+                    ),
+                ],
+                upsert_edges: vec![contains.clone()],
+            })
+            .expect("seed patch applies");
+        assert!(graph.edges.contains_key(&contains.id));
+        assert_eq!(
+            graph.children.get(&project_id).map(Vec::as_slice),
+            Some([child_id].as_slice())
+        );
+
+        graph
+            .apply_patch(GraphPatch {
+                base: graph.revision(),
+                removed_nodes: vec![child_id],
+                removed_edges: vec![],
+                upsert_nodes: vec![],
+                upsert_edges: vec![],
+            })
+            .expect("remove child without listing edges");
+
+        assert!(!graph.nodes.contains_key(&child_id));
+        assert!(graph.edges.is_empty());
+        assert!(
+            graph
+                .children
+                .get(&project_id)
+                .is_none_or(|children| children.is_empty())
+        );
     }
 }
