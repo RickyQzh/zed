@@ -32,8 +32,8 @@ Or add this to your `settings.json`:
 
 ## Panel {#panel}
 
-Toggle the Semantic Map panel with {#action semantic_map::ToggleFocus} from the
-command palette.
+Open Semantic Map from the command palette
+({#action semantic_map::ToggleFocus}) or **View → Semantic Map**.
 
 When the panel is focused, Zed indexes the project and lists nodes (subsystems
 and modules) with short intent summaries. Click a row to select it. Use
@@ -97,6 +97,10 @@ members = ["crates/editor", "crates/multi_buffer", "crates/language"]
 Repo config overrides clustering heuristics on the next index. When a
 subsystem pin includes a `summary`, that text becomes the subsystem's
 static intent on the map.
+
+This repository includes a root `semantic_map.toml` that groups Zed into
+product areas (`gpui-ui`, `editing`, `project-services`, `agent`, `collab`,
+and others). Other large workspaces should add their own file.
 
 ## Phase A limitations {#phase-a-limitations}
 

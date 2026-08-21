@@ -68,7 +68,10 @@ All under `semantic_map`. Master gate **`enabled: false`**.
 | `intent.llm_on_visible_only` | `true` |
 
 Repo pins: `semantic_map.toml` `[subsystems.<slug>] members = [...]` and
-optional `summary`.
+optional `summary`. This Zed checkout **has a root `semantic_map.toml`**
+(product areas: `gpui-ui`, `editing`, `project-services`, `agent`, `collab`,
+`git`, `app`, `debugger`, plus `other` for leftovers). Copy that pattern for
+other large workspaces.
 
 ---
 
