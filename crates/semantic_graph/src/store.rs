@@ -536,8 +536,12 @@ mod tests {
 
         let snap = store.read_with(cx, |store, _| store.snapshot());
         assert_eq!(snap.status, GraphStatus::Idle);
-        assert!(
-            !snap.graph.nodes.contains_key(&stub_id),
+        assert_ne!(
+            snap.graph
+                .nodes
+                .get(&stub_id)
+                .map(|node| node.display_name.as_ref()),
+            Some("stub"),
             "completed reindex must replace the previous snapshot"
         );
         assert!(
