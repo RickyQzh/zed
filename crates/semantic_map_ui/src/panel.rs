@@ -231,10 +231,12 @@ impl SemanticMapPanel {
         }
         self.reindex_debounce_task.take();
         let options = Self::build_options_from_settings(SemanticMapSettings::get_global(cx));
-        self.project.update(cx, |project, cx| {
-            project.reindex_semantic_graph(options, cx);
+        let started = self.project.update(cx, |project, cx| {
+            project.reindex_semantic_graph(options, cx)
         });
-        self.has_reindexed = true;
+        if started {
+            self.has_reindexed = true;
+        }
     }
 
     fn build_options_from_settings(
@@ -373,18 +375,13 @@ fn path_has_ignored_component(path: &Path) -> bool {
     })
 }
 
-fn is_rust_under_src(path: &Path) -> bool {
-    path.extension().and_then(|extension| extension.to_str()) == Some("rs")
-        && path
-            .components()
-            .any(|component| component.as_os_str() == "src")
-}
-
 fn is_crate_root_readme(path: &Path) -> bool {
     let is_readme = path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("README.md"));
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("README.md") || name.eq_ignore_ascii_case("README")
+        });
     if !is_readme {
         return false;
     }
@@ -400,7 +397,10 @@ fn is_crate_root_readme(path: &Path) -> bool {
     }
 }
 
-/// Returns whether a changed path should trigger a semantic-graph rebuild.
+/// Returns whether a changed path should trigger a live semantic-graph rebuild.
+///
+/// Live auto-reindex is limited to crate-structure files. Manual Reindex still
+/// full-rebuilds regardless of which path changed.
 fn should_reindex_path(path: &Path) -> bool {
     if path_has_ignored_component(path) {
         return false;
@@ -411,17 +411,12 @@ fn should_reindex_path(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or("");
     if file_name.eq_ignore_ascii_case("Cargo.toml")
+        || file_name.eq_ignore_ascii_case("Cargo.lock")
         || file_name.eq_ignore_ascii_case("semantic_map.toml")
-        || file_name.eq_ignore_ascii_case("build.rs")
     {
         return true;
     }
-    if is_crate_root_readme(path) || is_rust_under_src(path) {
-        return true;
-    }
-
-    // Added/removed directories typically have no extension.
-    !file_name.is_empty() && path.extension().is_none()
+    is_crate_root_readme(path)
 }
 
 fn should_reindex_worktree_change(path: &Path, change: PathChange) -> bool {
@@ -893,18 +888,25 @@ mod tests {
 
         assert!(should_reindex_path(Path::new("Cargo.toml")));
         assert!(should_reindex_path(Path::new("crates/foo/Cargo.toml")));
+        assert!(should_reindex_path(Path::new("Cargo.lock")));
+        assert!(should_reindex_path(Path::new("crates/foo/Cargo.lock")));
         assert!(should_reindex_path(Path::new("semantic_map.toml")));
         assert!(should_reindex_path(Path::new(
             "crates/foo/semantic_map.toml"
         )));
-        assert!(should_reindex_path(Path::new("build.rs")));
-        assert!(should_reindex_path(Path::new("src/lib.rs")));
-        assert!(should_reindex_path(Path::new("crates/foo/src/main.rs")));
         assert!(should_reindex_path(Path::new("README.md")));
         assert!(should_reindex_path(Path::new("crates/foo/README.md")));
-        assert!(should_reindex_path(Path::new("src")));
-        assert!(should_reindex_path(Path::new("crates/new_crate")));
+        assert!(should_reindex_path(Path::new("README")));
+        assert!(should_reindex_path(Path::new("crates/foo/README")));
 
+        assert!(!should_reindex_path(Path::new("build.rs")));
+        assert!(!should_reindex_path(Path::new("src/lib.rs")));
+        assert!(!should_reindex_path(Path::new("crates/foo/src/main.rs")));
+        assert!(!should_reindex_path(Path::new("src")));
+        assert!(!should_reindex_path(Path::new("crates/new_crate")));
+        assert!(!should_reindex_path(Path::new("LICENSE")));
+        assert!(!should_reindex_path(Path::new("Makefile")));
+        assert!(!should_reindex_path(Path::new(".gitignore")));
         assert!(!should_reindex_path(Path::new("notes.md")));
         assert!(!should_reindex_path(Path::new("src/README.md")));
         assert!(!should_reindex_path(Path::new("docs/guide.md")));
@@ -929,7 +931,7 @@ mod tests {
             Path::new("Cargo.toml"),
             PathChange::Updated
         ));
-        assert!(should_reindex_worktree_change(
+        assert!(!should_reindex_worktree_change(
             Path::new("src/lib.rs"),
             PathChange::Added
         ));
@@ -958,6 +960,35 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert!(panel.enabled);
             assert!(panel.has_reindexed);
+        });
+    }
+
+    #[gpui::test]
+    async fn start_reindex_does_not_latch_without_visible_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let panel = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    SemanticMapPanel::new(workspace, window, cx)
+                })
+            })
+            .unwrap();
+
+        enable_semantic_map(cx);
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.enabled);
+            assert!(
+                !panel.has_reindexed,
+                "must not latch has_reindexed when reindex_semantic_graph returns false"
+            );
         });
     }
 

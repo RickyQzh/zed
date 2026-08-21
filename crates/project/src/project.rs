@@ -2221,8 +2221,9 @@ impl Project {
 
     /// Rebuild the semantic graph for the first visible worktree.
     ///
-    /// No-op when there are no visible worktrees. Settings gating is Task 8/10;
-    /// callers should only invoke this when the feature is enabled.
+    /// Returns `true` when a store reindex was started. No-op (`false`) when there
+    /// are no visible worktrees. Settings gating is Task 8/10; callers should only
+    /// invoke this when the feature is enabled.
     ///
     /// `options.max_auto_nodes` caps auto-indexed graph size; overflow yields
     /// [`semantic_graph::GraphStatus::Partial`].
@@ -2231,9 +2232,9 @@ impl Project {
         &self,
         options: semantic_graph::BuildGraphOptions,
         cx: &mut App,
-    ) {
+    ) -> bool {
         let Some(worktree) = self.visible_worktrees(cx).next() else {
-            return;
+            return false;
         };
         let (root, worktree_id) = {
             let worktree = worktree.read(cx);
@@ -2242,6 +2243,7 @@ impl Project {
         self.semantic_graph.update(cx, |store, cx| {
             store.reindex(root, worktree_id, options, cx);
         });
+        true
     }
 
     #[inline]

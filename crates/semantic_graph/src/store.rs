@@ -47,6 +47,7 @@ pub struct SemanticGraphStore {
     intents: IntentIndex,
     status: GraphStatus,
     reindex_task: Option<Task<()>>,
+    reindex_generation: u64,
 }
 
 impl EventEmitter<SemanticGraphEvent> for SemanticGraphStore {}
@@ -58,6 +59,7 @@ impl SemanticGraphStore {
             intents: IntentIndex::default(),
             status: GraphStatus::Idle,
             reindex_task: None,
+            reindex_generation: 0,
         }
     }
 
@@ -98,7 +100,11 @@ impl SemanticGraphStore {
         cx.notify();
     }
 
-    /// Clear the current graph and rebuild for `root` on a background thread.
+    /// Rebuild the graph for `root` on a background thread.
+    ///
+    /// The last good snapshot stays visible while `status` is [`GraphStatus::Indexing`].
+    /// A newer `reindex` increments a generation counter so a superseded build is ignored.
+    /// Assigning `reindex_task` drops the previous task and cancels it.
     ///
     /// When the built graph would exceed `options.max_auto_nodes`, nodes are truncated and
     /// status becomes [`GraphStatus::Partial`].
@@ -112,11 +118,9 @@ impl SemanticGraphStore {
         options: BuildGraphOptions,
         cx: &mut Context<Self>,
     ) {
-        self.graph = SemanticGraph::default();
-        self.intents = IntentIndex::default();
+        self.reindex_generation = self.reindex_generation.wrapping_add(1);
+        let generation = self.reindex_generation;
         self.status = GraphStatus::Indexing;
-        let revision = self.graph.revision();
-        cx.emit(SemanticGraphEvent::Updated { revision });
         cx.notify();
 
         let max_auto_nodes = options.max_auto_nodes;
@@ -125,24 +129,29 @@ impl SemanticGraphStore {
         });
         self.reindex_task = Some(cx.spawn(async move |this, cx| {
             let result = build.await;
-            match this.update(cx, |this, cx| match result {
-                Ok((graph, intents, truncated)) => {
-                    let status = if truncated {
-                        GraphStatus::Partial {
-                            reason: SharedString::from(format!(
-                                "Graph truncated to {max_auto_nodes} nodes (max_auto_nodes)"
-                            )),
-                        }
-                    } else {
-                        GraphStatus::Idle
-                    };
-                    this.replace_graph_with_status(graph, intents, status, cx);
+            match this.update(cx, |this, cx| {
+                if this.reindex_generation != generation {
+                    return;
                 }
-                Err(error) => {
-                    this.status = GraphStatus::Error {
-                        message: SharedString::from(format!("{error:#}")),
-                    };
-                    cx.notify();
+                match result {
+                    Ok((graph, intents, truncated)) => {
+                        let status = if truncated {
+                            GraphStatus::Partial {
+                                reason: SharedString::from(format!(
+                                    "Graph truncated to {max_auto_nodes} nodes (max_auto_nodes)"
+                                )),
+                            }
+                        } else {
+                            GraphStatus::Idle
+                        };
+                        this.replace_graph_with_status(graph, intents, status, cx);
+                    }
+                    Err(error) => {
+                        this.status = GraphStatus::Error {
+                            message: SharedString::from(format!("{error:#}")),
+                        };
+                        cx.notify();
+                    }
                 }
             }) {
                 Ok(()) => {}
@@ -481,5 +490,102 @@ mod tests {
             module_count <= max_auto_nodes,
             "module count must not exceed budget"
         );
+    }
+
+    #[gpui::test]
+    async fn reindex_keeps_last_snapshot_until_build_applies(cx: &mut TestAppContext) {
+        let root = Arc::<Path>::from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("test_data/simple_workspace")
+                .into_boxed_path(),
+        );
+        let worktree_id = WorktreeId::from_usize(1);
+        let store = cx.new(|cx| SemanticGraphStore::new(cx));
+
+        let stub_key = NodeKey::Project { worktree_id };
+        let stub_id = NodeId::from_key(&stub_key);
+        store.update(cx, |store, cx| {
+            store
+                .apply_patch(
+                    GraphPatch {
+                        base: store.snapshot().revision,
+                        removed_nodes: vec![],
+                        removed_edges: vec![],
+                        upsert_nodes: vec![Node::project(stub_id, stub_key, "stub")],
+                        upsert_edges: vec![],
+                    },
+                    cx,
+                )
+                .unwrap();
+        });
+
+        store.update(cx, |store, cx| {
+            store.reindex(root.clone(), worktree_id, BuildGraphOptions::default(), cx);
+        });
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.status(), &GraphStatus::Indexing);
+            assert!(
+                store.graph.nodes.contains_key(&stub_id),
+                "reindex must keep the last good snapshot while Indexing"
+            );
+            assert_eq!(store.graph.nodes.len(), 1);
+        });
+
+        cx.run_until_parked();
+
+        let snap = store.read_with(cx, |store, _| store.snapshot());
+        assert_eq!(snap.status, GraphStatus::Idle);
+        assert!(
+            !snap.graph.nodes.contains_key(&stub_id),
+            "completed reindex must replace the previous snapshot"
+        );
+        assert!(
+            snap.graph.nodes.values().any(|node| {
+                node.kind == NodeKind::Module && node.display_name.as_ref() == "core_lib"
+            }),
+            "expected cargo fixture modules after reindex apply"
+        );
+    }
+
+    #[gpui::test]
+    async fn reindex_ignores_superseded_generation(cx: &mut TestAppContext) {
+        let root = Arc::<Path>::from(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("test_data/simple_workspace")
+                .into_boxed_path(),
+        );
+        let worktree_id = WorktreeId::from_usize(1);
+        let store = cx.new(|cx| SemanticGraphStore::new(cx));
+
+        let stub_key = NodeKey::Project { worktree_id };
+        let stub_id = NodeId::from_key(&stub_key);
+        store.update(cx, |store, cx| {
+            store
+                .apply_patch(
+                    GraphPatch {
+                        base: store.snapshot().revision,
+                        removed_nodes: vec![],
+                        removed_edges: vec![],
+                        upsert_nodes: vec![Node::project(stub_id, stub_key, "stub")],
+                        upsert_edges: vec![],
+                    },
+                    cx,
+                )
+                .unwrap();
+            store.reindex(root.clone(), worktree_id, BuildGraphOptions::default(), cx);
+            store.reindex_generation = store.reindex_generation.wrapping_add(1);
+        });
+
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.status(), &GraphStatus::Indexing);
+            assert!(
+                store.graph.nodes.contains_key(&stub_id),
+                "stale reindex generation must not replace the last good snapshot"
+            );
+            assert_eq!(store.graph.nodes.len(), 1);
+        });
     }
 }
