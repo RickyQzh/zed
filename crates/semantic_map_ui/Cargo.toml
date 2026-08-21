@@ -18,7 +18,6 @@ db.workspace = true
 gpui.workspace = true
 project.workspace = true
 semantic_graph.workspace = true
-serde_json.workspace = true
 settings.workspace = true
 ui.workspace = true
 util.workspace = true

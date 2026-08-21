@@ -1,5 +1,10 @@
 # Semantic Map Phase A Implementation Plan
 
+> **Status (2026-08-21):** Phase A is implemented on `cursor/semantic-map-design-281a` / PR #1.
+> Task checkboxes below are a historical recipe and are **stale** (left unchecked).
+> Do **not** re-run this plan. Next work is Phase **C0** then C, then B — see
+> `docs/superpowers/handoff/semantic-map-status.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship a Zed-native Semantic Map (IR store + Rust/generic extractors + static intents + side panel + central canvas) so opening a project answers “what is the structure and what does it do?” without reading code linearly.

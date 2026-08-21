@@ -1,4 +1,4 @@
-use gpui::{point, size, Bounds, Point, SharedString};
+use gpui::{Bounds, Point, SharedString, point, size};
 use semantic_graph::{
     CanvasPins, EdgeId, EdgeKind, IntentIndex, Lens, Node, NodeId, NodeKind, SemanticGraph,
     SemanticGraphSnapshot, hierarchy,
@@ -6,6 +6,17 @@ use semantic_graph::{
 
 const NODE_WIDTH: f32 = 200.0;
 const NODE_HEIGHT: f32 = 80.0;
+
+/// Default Phase A lens: project structure without Entry/Type/External rows.
+pub fn orientation_lens(hide_external: bool, hide_tests: bool, module_depth: u32) -> Lens {
+    Lens {
+        hide_external,
+        hide_tests,
+        max_depth: Some(module_depth),
+        allowed_kinds: vec![NodeKind::Project, NodeKind::Subsystem, NodeKind::Module],
+        ..Lens::default()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanelRow {
@@ -210,8 +221,16 @@ fn intent_summary(intents: &IntentIndex, node_id: NodeId) -> Option<SharedString
 fn sorted_children(graph: &SemanticGraph, parent: NodeId) -> Vec<NodeId> {
     let mut children = graph.children.get(&parent).cloned().unwrap_or_default();
     children.sort_by(|a, b| {
-        let name_a = graph.nodes.get(a).map(|n| n.display_name.as_ref()).unwrap_or("");
-        let name_b = graph.nodes.get(b).map(|n| n.display_name.as_ref()).unwrap_or("");
+        let name_a = graph
+            .nodes
+            .get(a)
+            .map(|n| n.display_name.as_ref())
+            .unwrap_or("");
+        let name_b = graph
+            .nodes
+            .get(b)
+            .map(|n| n.display_name.as_ref())
+            .unwrap_or("");
         name_a.cmp(name_b).then_with(|| a.cmp(b))
     });
     children
@@ -262,7 +281,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use semantic_graph::{
-        Edge, EcosystemKind, ExternalPayload, GraphPatch, GraphRevision, GraphStatus, ModuleKind,
+        EcosystemKind, Edge, ExternalPayload, GraphPatch, GraphRevision, GraphStatus, ModuleKind,
         ModulePayload, ModuleRef, Node, NodeFlags, NodeId, NodeKey, NodeKind, NodePayload,
         SemanticGraph, SubsystemPayload,
     };
@@ -437,9 +456,10 @@ mod tests {
 
         for expected in ["app", "core_lib"] {
             assert!(
-                panel.rows.iter().any(|row| {
-                    row.name.as_ref() == expected && row.kind == NodeKind::Module
-                }),
+                panel
+                    .rows
+                    .iter()
+                    .any(|row| { row.name.as_ref() == expected && row.kind == NodeKind::Module }),
                 "panel should list module {expected}, rows={:?}",
                 panel
                     .rows
@@ -478,15 +498,48 @@ mod tests {
         assert!(
             panel.rows.iter().any(|row| {
                 row.kind == NodeKind::Subsystem
-                    && row
-                        .intent_summary
-                        .as_ref()
-                        .is_some_and(|summary| {
-                            summary.to_lowercase().contains("application binary")
-                        })
+                    && row.intent_summary.as_ref().is_some_and(|summary| {
+                        summary.to_lowercase().contains("application binary")
+                    })
             }),
             "panel should show the pin summary as a subsystem intent"
         );
+    }
+
+    #[test]
+    fn orientation_lens_hides_entry_rows() {
+        let root = simple_workspace_root();
+        let snapshot = semantic_graph::GraphIndexer::reindex_cargo_or_generic(
+            &root,
+            WorktreeId::from_usize(1),
+        )
+        .expect("fixture snapshot should build without a Project");
+
+        let lens = orientation_lens(true, true, 3);
+        let panel = PanelViewModel::from_snapshot(&snapshot, &lens);
+        assert!(
+            panel.rows.iter().all(|row| {
+                matches!(
+                    row.kind,
+                    NodeKind::Project | NodeKind::Subsystem | NodeKind::Module
+                )
+            }),
+            "orientation lens must drop Entry/Type/External rows, got {:?}",
+            panel
+                .rows
+                .iter()
+                .map(|row| (row.name.to_string(), row.kind))
+                .collect::<Vec<_>>()
+        );
+        for expected in ["app", "core_lib"] {
+            assert!(
+                panel
+                    .rows
+                    .iter()
+                    .any(|row| row.name.as_ref() == expected && row.kind == NodeKind::Module),
+                "orientation lens should still list module {expected}"
+            );
+        }
     }
 
     #[test]

@@ -13,11 +13,7 @@ impl SemanticMapSelection {
         }
     }
 
-    pub fn select(
-        &mut self,
-        node_ids: impl IntoIterator<Item = NodeId>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn select(&mut self, node_ids: impl IntoIterator<Item = NodeId>, cx: &mut Context<Self>) {
         self.selected = node_ids.into_iter().collect();
         cx.notify();
     }

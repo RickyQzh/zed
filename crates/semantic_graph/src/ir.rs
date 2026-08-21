@@ -179,6 +179,11 @@ impl Node {
             flags,
         }
     }
+
+    pub fn with_location(mut self, location: Option<SourceLocation>) -> Self {
+        self.location = location;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, EnumIter)]

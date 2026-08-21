@@ -55,7 +55,7 @@ impl Settings for SemanticMapSettings {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use settings::{RootUserSettings, Settings, SettingsContent, SemanticMapSkin};
+    use settings::{RootUserSettings, SemanticMapSkin, Settings, SettingsContent};
 
     use super::SemanticMapSettings;
 

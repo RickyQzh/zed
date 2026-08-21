@@ -36,7 +36,8 @@ pub fn extract_cargo_workspace(root: &Path, worktree_id: WorktreeId) -> Result<G
     let root_toml = read_toml(&root_manifest)?;
 
     let member_dirs = workspace_member_dirs(root, &root_toml)?;
-    let packages = load_packages(root, &member_dirs)?;
+    let workspace_dep_paths = workspace_dependency_paths(&root_toml);
+    let packages = load_packages(root, &member_dirs, &workspace_dep_paths)?;
 
     let project_key = NodeKey::Project { worktree_id };
     let project_id = NodeId::from_key(&project_key);
@@ -44,7 +45,15 @@ pub fn extract_cargo_workspace(root: &Path, worktree_id: WorktreeId) -> Result<G
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("project");
-    let project_node = Node::project(project_id, project_key, project_name);
+    let cargo_toml =
+        RelPath::from_unix_str("Cargo.toml").context("Cargo.toml is not a valid relative path")?;
+    let project_node =
+        Node::project(project_id, project_key, project_name).with_location(Some(SourceLocation {
+            worktree_id,
+            path: Arc::from(cargo_toml),
+            range: None,
+            symbol: None,
+        }));
 
     let mut upsert_nodes = vec![project_node];
     let mut upsert_edges = Vec::new();
@@ -105,6 +114,7 @@ pub fn extract_cargo_workspace(root: &Path, worktree_id: WorktreeId) -> Result<G
             },
             NodeFlags {
                 is_entry_point: package.has_bin && !package.has_lib,
+                is_test: package_is_test(&package.name, &package.manifest_dir),
                 ..NodeFlags::default()
             },
         );
@@ -155,13 +165,20 @@ pub fn extract_cargo_workspace(root: &Path, worktree_id: WorktreeId) -> Result<G
             continue;
         };
         for dep in &package.path_deps {
-            let dep_manifest = canonicalize_join(&package.manifest_dir, &dep.path)?;
+            let base = if dep.relative_to_workspace {
+                root
+            } else {
+                package.manifest_dir.as_path()
+            };
+            let dep_manifest = canonicalize_join(base, &dep.path)?;
             let target_name = package_by_manifest_dir
                 .get(&dep_manifest)
                 .cloned()
                 .or_else(|| {
                     // Fall back to dependency key when the path resolves to a known package name.
-                    package_ids.contains_key(&dep.name).then(|| dep.name.clone())
+                    package_ids
+                        .contains_key(&dep.name)
+                        .then(|| dep.name.clone())
                 });
             let Some(target_name) = target_name else {
                 continue;
@@ -219,6 +236,17 @@ struct BinTarget {
 struct PathDep {
     name: String,
     path: PathBuf,
+    relative_to_workspace: bool,
+}
+
+fn package_is_test(name: &str, manifest_dir: &Path) -> bool {
+    if name == "tests" || name.ends_with("_test") || name.ends_with("_tests") {
+        return true;
+    }
+    manifest_dir
+        .file_name()
+        .and_then(|component| component.to_str())
+        == Some("tests")
 }
 
 fn entry_node(
@@ -330,10 +358,11 @@ fn collect_glob_member_dirs(
     if depth > 8 {
         return Ok(());
     }
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("failed to read {}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read entry under {}", dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read entry under {}", dir.display()))?;
         let path = entry.path();
         let file_type = entry
             .file_type()
@@ -364,15 +393,23 @@ fn canonicalize_or_normalize(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| normalize_path(path))
 }
 
-fn load_packages(root: &Path, member_dirs: &[PathBuf]) -> Result<Vec<PackageInfo>> {
+fn load_packages(
+    root: &Path,
+    member_dirs: &[PathBuf],
+    workspace_dep_paths: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<PackageInfo>> {
     let mut packages = Vec::new();
     for dir in member_dirs {
-        packages.push(load_package(root, dir)?);
+        packages.push(load_package(root, dir, workspace_dep_paths)?);
     }
     Ok(packages)
 }
 
-fn load_package(_root: &Path, manifest_dir: &Path) -> Result<PackageInfo> {
+fn load_package(
+    _root: &Path,
+    manifest_dir: &Path,
+    workspace_dep_paths: &BTreeMap<String, PathBuf>,
+) -> Result<PackageInfo> {
     let manifest_path = manifest_dir.join("Cargo.toml");
     let value = read_toml(&manifest_path)?;
     let package_table = value
@@ -392,7 +429,7 @@ fn load_package(_root: &Path, manifest_dir: &Path) -> Result<PackageInfo> {
         .clone()
         .or_else(|| bin_targets.first().map(|bin| bin.path.clone()));
 
-    let path_deps = path_dependencies(&value);
+    let path_deps = path_dependencies(&value, workspace_dep_paths);
 
     Ok(PackageInfo {
         name,
@@ -418,7 +455,11 @@ fn resolve_lib_path(manifest_dir: &Path, value: &toml::Value) -> Option<PathBuf>
     default.is_file().then_some(default)
 }
 
-fn resolve_bin_targets(manifest_dir: &Path, value: &toml::Value, package_name: &str) -> Vec<BinTarget> {
+fn resolve_bin_targets(
+    manifest_dir: &Path,
+    value: &toml::Value,
+    package_name: &str,
+) -> Vec<BinTarget> {
     let mut bins = Vec::new();
 
     if let Some(bin_array) = value.get("bin").and_then(|bin| bin.as_array()) {
@@ -468,20 +509,63 @@ fn resolve_bin_targets(manifest_dir: &Path, value: &toml::Value, package_name: &
     bins
 }
 
-fn path_dependencies(value: &toml::Value) -> Vec<PathDep> {
+fn workspace_dependency_paths(root_toml: &toml::Value) -> BTreeMap<String, PathBuf> {
+    let mut paths = BTreeMap::new();
+    let Some(table) = root_toml
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|dependencies| dependencies.as_table())
+    else {
+        return paths;
+    };
+    for (name, spec) in table {
+        let Some(path) = spec
+            .as_table()
+            .and_then(|table| table.get("path"))
+            .and_then(|path| path.as_str())
+        else {
+            continue;
+        };
+        paths.insert(name.clone(), PathBuf::from(path));
+    }
+    paths
+}
+
+fn spec_is_workspace_dep(spec: &toml::Value) -> bool {
+    spec.as_table()
+        .and_then(|table| table.get("workspace"))
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+fn path_dependencies(
+    value: &toml::Value,
+    workspace_paths: &BTreeMap<String, PathBuf>,
+) -> Vec<PathDep> {
     let mut deps = Vec::new();
     let Some(table) = value.get("dependencies").and_then(|deps| deps.as_table()) else {
         return deps;
     };
     for (name, spec) in table {
-        let path = match spec {
-            toml::Value::Table(table) => table.get("path").and_then(|path| path.as_str()),
-            _ => None,
-        };
-        if let Some(path) = path {
+        if let Some(path) = spec
+            .as_table()
+            .and_then(|table| table.get("path"))
+            .and_then(|path| path.as_str())
+        {
             deps.push(PathDep {
                 name: name.clone(),
                 path: PathBuf::from(path),
+                relative_to_workspace: false,
+            });
+            continue;
+        }
+        if spec_is_workspace_dep(spec)
+            && let Some(path) = workspace_paths.get(name)
+        {
+            deps.push(PathDep {
+                name: name.clone(),
+                path: path.clone(),
+                relative_to_workspace: true,
             });
         }
     }
@@ -526,8 +610,8 @@ fn rel_path_from_root(root: &Path, absolute: &Path) -> Result<Arc<RelPath>> {
         .to_str()
         .with_context(|| format!("non-utf8 relative path {}", relative.display()))?
         .replace('\\', "/");
-    let rel = RelPath::from_unix_str(&unix)
-        .with_context(|| format!("invalid relative path {unix}"))?;
+    let rel =
+        RelPath::from_unix_str(&unix).with_context(|| format!("invalid relative path {unix}"))?;
     Ok(rel.into())
 }
 
@@ -538,7 +622,7 @@ mod tests {
 
     use worktree::WorktreeId;
 
-    use super::extract_cargo_workspace;
+    use super::{extract_cargo_workspace, package_is_test};
     use crate::{EdgeKind, NodeKind, SemanticGraph};
 
     #[test]
@@ -558,10 +642,7 @@ mod tests {
         assert!(names.contains("core_lib"));
 
         assert!(
-            graph
-                .edges
-                .values()
-                .any(|e| e.kind == EdgeKind::DependsOn),
+            graph.edges.values().any(|e| e.kind == EdgeKind::DependsOn),
             "expected DependsOn edge from app to core_lib"
         );
     }
@@ -622,6 +703,101 @@ edition = "2021"
         assert_eq!(
             names,
             BTreeSet::from(["alpha".to_string(), "beta".to_string()])
+        );
+    }
+
+    #[test]
+    fn cargo_project_location_is_root_cargo_toml() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/simple_workspace");
+        let patch = extract_cargo_workspace(&root, WorktreeId::from_usize(1)).unwrap();
+        let project = patch
+            .upsert_nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Project)
+            .expect("project node");
+        let path = project
+            .location
+            .as_ref()
+            .expect("project location")
+            .path
+            .as_unix_str();
+        assert!(
+            path.ends_with("Cargo.toml"),
+            "expected Project.location to end with Cargo.toml, got {path}"
+        );
+    }
+
+    #[test]
+    fn package_is_test_matches_name_and_manifest_dir() {
+        use std::path::Path;
+
+        assert!(package_is_test("foo_tests", Path::new("crates/foo_tests")));
+        assert!(package_is_test("foo_test", Path::new("crates/foo_test")));
+        assert!(package_is_test("tests", Path::new("crates/integration")));
+        assert!(package_is_test("helpers", Path::new("crates/tests")));
+        assert!(!package_is_test(
+            "editor_benchmarks",
+            Path::new("crates/editor_benchmarks")
+        ));
+        assert!(!package_is_test("core_lib", Path::new("crates/core_lib")));
+    }
+
+    #[test]
+    fn cargo_extractor_resolves_workspace_true_path_deps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+core_lib = { path = "crates/core_lib" }
+"#,
+        )
+        .unwrap();
+        for (name, extra) in [
+            ("core_lib", ""),
+            ("app", "\n[dependencies]\ncore_lib.workspace = true\n"),
+        ] {
+            let crate_dir = root.join("crates").join(name);
+            std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+            std::fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!(
+                    r#"
+[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+{extra}
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(crate_dir.join("src/lib.rs"), "// lib\n").unwrap();
+        }
+
+        let patch = extract_cargo_workspace(root, WorktreeId::from_usize(1)).unwrap();
+        let mut graph = SemanticGraph::default();
+        graph.apply_patch(patch).unwrap();
+
+        let id = |name: &str| {
+            graph
+                .nodes
+                .values()
+                .find(|node| node.kind == NodeKind::Module && node.display_name.as_ref() == name)
+                .map(|node| node.id)
+                .unwrap_or_else(|| panic!("missing module {name}"))
+        };
+        let app_id = id("app");
+        let core_lib_id = id("core_lib");
+        assert!(
+            graph.edges.values().any(|edge| {
+                edge.kind == EdgeKind::DependsOn && edge.from == app_id && edge.to == core_lib_id
+            }),
+            "workspace = true should resolve to DependsOn(app → core_lib)"
         );
     }
 }

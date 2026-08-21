@@ -5,9 +5,9 @@ use std::time::Instant;
 use worktree::WorktreeId;
 
 use crate::{
-    build_initial_graph, extract_cargo_workspace, is_synthetic_subsystem_slug, load_pin_config_from_root,
-    BuildGraphOptions, EdgeKind, GraphIndexer, GraphStatus, NodeKind, SemanticGraph,
-    SemanticGraphSnapshot, OTHER_SUBSYSTEM_SLUG,
+    BuildGraphOptions, EdgeKind, GraphIndexer, GraphStatus, NodeKind, OTHER_SUBSYSTEM_SLUG,
+    SemanticGraph, SemanticGraphSnapshot, build_initial_graph, extract_cargo_workspace,
+    is_synthetic_subsystem_slug, load_pin_config_from_root,
 };
 
 fn simple_workspace_root() -> PathBuf {
@@ -16,9 +16,7 @@ fn simple_workspace_root() -> PathBuf {
 
 fn zed_workspace_root() -> PathBuf {
     let from_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    from_manifest
-        .canonicalize()
-        .unwrap_or(from_manifest)
+    from_manifest.canonicalize().unwrap_or(from_manifest)
 }
 
 fn dogfood_options() -> BuildGraphOptions {
@@ -45,6 +43,49 @@ fn module_id(graph: &SemanticGraph, name: &str) -> crate::NodeId {
         .find(|node| node.kind == NodeKind::Module && node.display_name.as_ref() == name)
         .map(|node| node.id)
         .unwrap_or_else(|| panic!("expected module named {name}"))
+}
+
+fn subsystem_contains_module(
+    graph: &SemanticGraph,
+    subsystem_slug: &str,
+    module_name: &str,
+) -> bool {
+    let Some(subsystem_id) = graph
+        .nodes
+        .values()
+        .find(|node| {
+            node.kind == NodeKind::Subsystem && node.display_name.as_ref() == subsystem_slug
+        })
+        .map(|node| node.id)
+    else {
+        return false;
+    };
+    let Some(target_module_id) = graph
+        .nodes
+        .values()
+        .find(|node| node.kind == NodeKind::Module && node.display_name.as_ref() == module_name)
+        .map(|node| node.id)
+    else {
+        return false;
+    };
+
+    let mut pending = vec![subsystem_id];
+    let mut visited = BTreeSet::new();
+    while let Some(current_id) = pending.pop() {
+        if !visited.insert(current_id) {
+            continue;
+        }
+        if current_id == target_module_id {
+            return true;
+        }
+        match graph.children.get(&current_id) {
+            Some(child_ids) => pending.extend(child_ids.iter().copied()),
+            None => pending.extend(graph.edges.values().filter_map(|edge| {
+                (edge.kind == EdgeKind::Contains && edge.from == current_id).then_some(edge.to)
+            })),
+        }
+    }
+    false
 }
 
 fn snapshot_is_usable(snapshot: &SemanticGraphSnapshot) {
@@ -109,12 +150,10 @@ fn user_can_understand_simple_workspace_from_map() {
         core_lib_intent.summary
     );
 
-    let pin_intent = snapshot.intents.values().find(|intent| {
-        intent
-            .summary
-            .to_lowercase()
-            .contains("application binary")
-    });
+    let pin_intent = snapshot
+        .intents
+        .values()
+        .find(|intent| intent.summary.to_lowercase().contains("application binary"));
     assert!(
         pin_intent.is_some(),
         "pin summary “Application binary” should appear as a subsystem intent, intents={:?}",
@@ -165,10 +204,7 @@ fn dogfood_zed_workspace_indexes_well_known_crates() {
             .expect("dogfood build_initial_graph should return Ok");
     let elapsed = started.elapsed();
 
-    assert!(
-        !graph.nodes.is_empty(),
-        "dogfood graph should be non-empty"
-    );
+    assert!(!graph.nodes.is_empty(), "dogfood graph should be non-empty");
     assert!(
         !intents.is_empty(),
         "dogfood should include Project / pin-summary intents"
@@ -182,6 +218,32 @@ fn dogfood_zed_workspace_indexes_well_known_crates() {
         );
     }
 
+    assert!(
+        subsystem_contains_module(&graph, "editing", "editor"),
+        "module `editor` should be a Contains descendant of subsystem `editing`"
+    );
+    assert!(
+        subsystem_contains_module(&graph, "gpui-ui", "gpui"),
+        "module `gpui` should be a Contains descendant of subsystem `gpui-ui`"
+    );
+    assert!(
+        subsystem_contains_module(&graph, "project-services", "project"),
+        "module `project` should be a Contains descendant of subsystem `project-services`"
+    );
+    assert!(
+        subsystem_contains_module(&graph, "agent", "agent"),
+        "module `agent` should be a Contains descendant of subsystem `agent`"
+    );
+
+    let editor_id = module_id(&graph, "editor");
+    let gpui_id = module_id(&graph, "gpui");
+    assert!(
+        graph.edges.values().any(|edge| {
+            edge.kind == EdgeKind::DependsOn && edge.from == editor_id && edge.to == gpui_id
+        }),
+        "editor should DependOn gpui so the canvas shows how editing uses GPUI"
+    );
+
     let subsystems: Vec<(String, u32)> = graph
         .nodes
         .values()
@@ -194,10 +256,7 @@ fn dogfood_zed_workspace_indexes_well_known_crates() {
             (node.display_name.to_string(), members)
         })
         .collect();
-    assert!(
-        !subsystems.is_empty(),
-        "dogfood must emit Subsystem nodes"
-    );
+    assert!(!subsystems.is_empty(), "dogfood must emit Subsystem nodes");
 
     let dominant = subsystems
         .iter()
@@ -215,8 +274,7 @@ fn dogfood_zed_workspace_indexes_well_known_crates() {
         "no subsystem-N names on the Zed map, got {subsystems:?}"
     );
 
-    let pins = load_pin_config_from_root(&root)
-        .expect("repo-root semantic_map.toml should parse");
+    let pins = load_pin_config_from_root(&root).expect("repo-root semantic_map.toml should parse");
     assert!(
         !pins.subsystems.is_empty(),
         "Zed checkout must ship semantic_map.toml product-area pins"
@@ -231,7 +289,10 @@ fn dogfood_zed_workspace_indexes_well_known_crates() {
             );
         };
         let intent = intents.get(&node.id).unwrap_or_else(|| {
-            panic!("pinned subsystem {:?} must have a non-empty intent", pin.slug)
+            panic!(
+                "pinned subsystem {:?} must have a non-empty intent",
+                pin.slug
+            )
         });
         assert!(
             !intent.summary.trim().is_empty(),

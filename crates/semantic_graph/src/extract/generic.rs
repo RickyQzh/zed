@@ -42,30 +42,22 @@ impl GenericThinExtractor {
 }
 
 /// Sync helper: walk directories up to `max_depth`, emit folder [`Module`](crate::NodeKind::Module) nodes.
-pub fn extract_generic(
-    root: &Path,
-    worktree_id: WorktreeId,
-    max_depth: u32,
-) -> Result<GraphPatch> {
+pub fn extract_generic(root: &Path, worktree_id: WorktreeId, max_depth: u32) -> Result<GraphPatch> {
     let project_key = NodeKey::Project { worktree_id };
     let project_id = NodeId::from_key(&project_key);
     let project_name = root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("project");
-    let project_node = Node::project(project_id, project_key, project_name);
+    let project_node = Node::project(project_id, project_key, project_name)
+        .with_location(project_readme_location(root, worktree_id)?);
 
     let mut upsert_nodes = vec![project_node];
     let mut upsert_edges = Vec::new();
 
     // BFS: (absolute_dir, relative_path, depth, parent_node_id)
     let mut queue: VecDeque<(PathBuf, Arc<RelPath>, u32, NodeId)> = VecDeque::new();
-    queue.push_back((
-        root.to_path_buf(),
-        RelPath::empty_arc(),
-        0,
-        project_id,
-    ));
+    queue.push_back((root.to_path_buf(), RelPath::empty_arc(), 0, project_id));
 
     while let Some((abs_dir, rel_path, depth, parent_id)) = queue.pop_front() {
         if depth > 0 {
@@ -107,25 +99,13 @@ pub fn extract_generic(
                 continue;
             }
 
-            enqueue_children(
-                &abs_dir,
-                &rel_path,
-                depth,
-                module_id,
-                &mut queue,
-            )?;
+            enqueue_children(&abs_dir, &rel_path, depth, module_id, &mut queue)?;
         } else {
             // Root depth 0: children become top-level modules under Project.
             if max_depth == 0 {
                 continue;
             }
-            enqueue_children(
-                &abs_dir,
-                &rel_path,
-                depth,
-                parent_id,
-                &mut queue,
-            )?;
+            enqueue_children(&abs_dir, &rel_path, depth, parent_id, &mut queue)?;
         }
     }
 
@@ -173,6 +153,25 @@ pub fn extract_generic(
     })
 }
 
+fn project_readme_location(root: &Path, worktree_id: WorktreeId) -> Result<Option<SourceLocation>> {
+    const README_NAMES: &[&str] = &["README.md", "Readme.md", "readme.md"];
+    let Some(name) = README_NAMES
+        .iter()
+        .copied()
+        .find(|name| root.join(name).is_file())
+    else {
+        return Ok(None);
+    };
+    let path = RelPath::from_unix_str(name)
+        .with_context(|| format!("invalid README relative path {name}"))?;
+    Ok(Some(SourceLocation {
+        worktree_id,
+        path: Arc::from(path),
+        range: None,
+        symbol: None,
+    }))
+}
+
 fn enqueue_children(
     abs_dir: &Path,
     parent_rel: &Arc<RelPath>,
@@ -184,7 +183,8 @@ fn enqueue_children(
         .with_context(|| format!("failed to read directory {}", abs_dir.display()))?;
     let mut children: Vec<PathBuf> = Vec::new();
     for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read entry under {}", abs_dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read entry under {}", abs_dir.display()))?;
         let path = entry.path();
         let file_type = entry
             .file_type()
@@ -217,9 +217,12 @@ fn enqueue_children(
                 .with_context(|| format!("invalid relative path {name}"))?
                 .into()
         } else {
-            Arc::from(parent_rel.join(RelPath::from_unix_str(name).with_context(|| {
-                format!("invalid relative path component {name}")
-            })?))
+            Arc::from(
+                parent_rel.join(
+                    RelPath::from_unix_str(name)
+                        .with_context(|| format!("invalid relative path component {name}"))?,
+                ),
+            )
         };
         queue.push_back((child_abs, child_rel, parent_depth + 1, parent_id));
     }
@@ -233,7 +236,7 @@ mod tests {
     use tempfile::tempdir;
     use worktree::WorktreeId;
 
-    use super::{extract_generic, GenericThinExtractor};
+    use super::{GenericThinExtractor, extract_generic};
     use crate::intent::StaticIntentProvider;
     use crate::{NodeKind, SemanticGraph};
 
@@ -242,11 +245,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(
-            root.join("README.md"),
-            "# Widgets\n\nUI widgets.\n",
-        )
-        .unwrap();
+        fs::write(root.join("README.md"), "# Widgets\n\nUI widgets.\n").unwrap();
 
         let worktree_id = WorktreeId::from_usize(1);
         let patch = GenericThinExtractor::extract_root(root, worktree_id, 2).unwrap();
@@ -301,7 +300,9 @@ mod tests {
             .collect();
 
         assert!(
-            module_names.iter().any(|name| name == "src" || name == "lib"),
+            module_names
+                .iter()
+                .any(|name| name == "src" || name == "lib"),
             "expected src/lib modules, got {module_names:?}"
         );
         assert!(

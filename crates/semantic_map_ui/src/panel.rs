@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::path::Path;
 use std::time::Duration;
@@ -9,7 +10,7 @@ use gpui::{
     uniform_list,
 };
 use project::{PathChange, Project, ProjectPath, worktree_store::WorktreeStoreEvent};
-use semantic_graph::{Lens, NodeId, SemanticGraphEvent, SourceLocation};
+use semantic_graph::{EdgeKind, Lens, NodeId, SemanticGraph, SemanticGraphEvent, SourceLocation};
 use settings::{Settings, SettingsStore};
 use ui::{Chip, Color, Label, LabelSize, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -89,6 +90,9 @@ impl SemanticMapPanel {
             subscriptions.push(cx.observe(&semantic_graph, |this, _, cx| {
                 this.refresh_view_model(cx);
             }));
+            subscriptions.push(cx.observe(&selection, |_, _, cx| {
+                cx.notify();
+            }));
             subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
                 this.on_settings_changed(cx);
             }));
@@ -158,12 +162,11 @@ impl SemanticMapPanel {
     }
 
     fn lens_from_settings(settings: &SemanticMapSettings) -> Lens {
-        Lens {
-            hide_external: settings.hide_external,
-            hide_tests: settings.hide_tests,
-            max_depth: Some(settings.module_depth as u32),
-            ..Lens::default()
-        }
+        crate::orientation_lens(
+            settings.hide_external,
+            settings.hide_tests,
+            settings.module_depth as u32,
+        )
     }
 
     fn refresh_view_model(&mut self, cx: &mut Context<Self>) {
@@ -440,16 +443,8 @@ pub(crate) fn open_node_source(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(location) = project
-        .read(cx)
-        .semantic_graph()
-        .read(cx)
-        .snapshot()
-        .graph
-        .nodes
-        .get(&node_id)
-        .and_then(|node| node.location.clone())
-    else {
+    let graph = project.read(cx).semantic_graph().read(cx).snapshot().graph;
+    let Some(location) = source_location_for_node(&graph, node_id) else {
         return;
     };
 
@@ -461,6 +456,45 @@ pub(crate) fn open_node_source(
                 .detach_and_log_err(cx);
         })
         .log_err();
+}
+
+fn source_location_for_node(graph: &SemanticGraph, node_id: NodeId) -> Option<SourceLocation> {
+    let node = graph.nodes.get(&node_id)?;
+    if let Some(location) = node.location.clone() {
+        return Some(location);
+    }
+
+    let mut visited = HashSet::from([node_id]);
+    let mut queue = VecDeque::from([node_id]);
+
+    while let Some(current_id) = queue.pop_front() {
+        let mut child_ids = graph.children.get(&current_id).cloned().unwrap_or_default();
+        if child_ids.is_empty() {
+            child_ids = graph
+                .edges
+                .values()
+                .filter_map(|edge| {
+                    (edge.kind == EdgeKind::Contains && edge.from == current_id).then_some(edge.to)
+                })
+                .collect();
+        }
+        child_ids.sort();
+        for child_id in child_ids {
+            if !visited.insert(child_id) {
+                continue;
+            }
+            if let Some(location) = graph
+                .nodes
+                .get(&child_id)
+                .and_then(|child| child.location.clone())
+            {
+                return Some(location);
+            }
+            queue.push_back(child_id);
+        }
+    }
+
+    None
 }
 
 impl EventEmitter<PanelEvent> for SemanticMapPanel {}
@@ -526,8 +560,8 @@ impl Panel for SemanticMapPanel {
         8
     }
 
-    fn enabled(&self, cx: &App) -> bool {
-        SemanticMapSettings::get_global(cx).enabled
+    fn enabled(&self, _cx: &App) -> bool {
+        true
     }
 }
 
@@ -629,9 +663,6 @@ pub fn register_panel_actions(
     _: &mut Context<Workspace>,
 ) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-        if !SemanticMapSettings::get_global(cx).enabled {
-            return;
-        }
         workspace.toggle_panel_focus::<SemanticMapPanel>(window, cx);
     });
     workspace.register_action(|workspace, _: &OpenSelectedSource, window, cx| {
@@ -667,11 +698,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use semantic_graph::{
-        GraphPatch, GraphRevision, GraphStatus, IntentIndex, Node, NodeFlags, NodeId, NodeKey,
-        NodeKind, SemanticGraph, SemanticGraphSnapshot, SubsystemPayload,
+        GraphPatch, GraphRevision, GraphStatus, IntentIndex, ModuleKind, ModulePayload, ModuleRef,
+        Node, NodeFlags, NodeId, NodeKey, NodeKind, SemanticGraph, SemanticGraphSnapshot,
+        SubsystemPayload,
     };
     use serde_json::json;
     use settings::SettingsStore;
+    use util::rel_path::RelPath;
     use workspace::MultiWorkspace;
     use worktree::WorktreeId;
 
@@ -866,20 +899,109 @@ mod tests {
 
     #[test]
     fn maps_source_location_to_project_path() {
-        use util::rel_path::RelPath;
-
         let worktree_id = WorktreeId::from_usize(7);
-        let path = RelPath::from_unix_str("src/lib.rs").expect("valid unix path");
-        let location = SourceLocation {
-            worktree_id,
-            path: Arc::from(path),
-            range: None,
-            symbol: None,
-        };
+        let location = test_source_location(worktree_id, "src/lib.rs");
 
         let project_path = project_path_from_source_location(&location);
         assert_eq!(project_path.worktree_id, worktree_id);
         assert_eq!(project_path.path.as_ref(), location.path.as_ref());
+    }
+
+    fn test_source_location(worktree_id: WorktreeId, path: &str) -> SourceLocation {
+        let path = RelPath::from_unix_str(path).expect("valid unix path");
+        SourceLocation {
+            worktree_id,
+            path: Arc::from(path),
+            range: None,
+            symbol: None,
+        }
+    }
+
+    fn module_node(worktree_id: WorktreeId, name: &str, location: Option<SourceLocation>) -> Node {
+        let key = NodeKey::Module {
+            worktree_id,
+            module_ref: ModuleRef::PathModule {
+                path: Arc::from(
+                    RelPath::from_unix_str(&format!("src/{name}.rs")).expect("valid unix path"),
+                ),
+            },
+        };
+        let id = NodeId::from_key(&key);
+        Node::module(
+            id,
+            key,
+            name,
+            location,
+            ModulePayload {
+                language: None,
+                module_kind: ModuleKind::FileModule,
+                public_exports: Vec::new(),
+                deps_out_count: 0,
+                deps_in_count: 0,
+                loc_estimate: None,
+            },
+            NodeFlags::default(),
+        )
+    }
+
+    fn graph_from_nodes_and_contains(
+        nodes: Vec<Node>,
+        contains: Vec<(NodeId, NodeId)>,
+    ) -> SemanticGraph {
+        let mut graph = SemanticGraph::default();
+        graph
+            .apply_patch(GraphPatch {
+                base: GraphRevision(0),
+                removed_nodes: Vec::new(),
+                removed_edges: Vec::new(),
+                upsert_nodes: nodes,
+                upsert_edges: contains
+                    .into_iter()
+                    .map(|(from, to)| semantic_graph::Edge::contains(from, to))
+                    .collect(),
+            })
+            .expect("patch applies");
+        graph
+    }
+
+    #[test]
+    fn source_location_prefers_the_node_itself() {
+        let worktree_id = WorktreeId::from_usize(1);
+        let location = test_source_location(worktree_id, "src/lib.rs");
+        let module = module_node(worktree_id, "lib", Some(location.clone()));
+        let module_id = module.id;
+        let graph = graph_from_nodes_and_contains(vec![module], Vec::new());
+
+        assert_eq!(source_location_for_node(&graph, module_id), Some(location));
+    }
+
+    #[test]
+    fn source_location_falls_back_to_contains_child_module() {
+        let worktree_id = WorktreeId::from_usize(1);
+        let project_key = NodeKey::Project { worktree_id };
+        let project_id = NodeId::from_key(&project_key);
+        let project = Node::project(project_id, project_key, "demo");
+        let child_location = test_source_location(worktree_id, "src/core.rs");
+        let module = module_node(worktree_id, "core", Some(child_location.clone()));
+        let module_id = module.id;
+        let graph =
+            graph_from_nodes_and_contains(vec![project, module], vec![(project_id, module_id)]);
+
+        assert_eq!(
+            source_location_for_node(&graph, project_id),
+            Some(child_location)
+        );
+    }
+
+    #[test]
+    fn source_location_returns_none_when_subtree_has_no_locations() {
+        let (snapshot, project_id, subsystem_id) = stub_snapshot();
+
+        assert_eq!(source_location_for_node(&snapshot.graph, project_id), None);
+        assert_eq!(
+            source_location_for_node(&snapshot.graph, subsystem_id),
+            None
+        );
     }
 
     #[test]
