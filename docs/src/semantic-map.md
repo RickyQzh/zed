@@ -35,10 +35,12 @@ Or add this to your `settings.json`:
 Open Semantic Map from the command palette
 ({#action semantic_map::ToggleFocus}) or **View → Semantic Map**.
 
-When the panel is focused, Zed indexes the project and lists nodes (subsystems
-and modules) with short intent summaries. Click a row to select it. Use
+When the panel is created or shown (if enabled), Zed indexes the project and
+lists nodes (subsystems and modules) with short intent summaries. Click a row
+to select it. Use
 {#action semantic_map::OpenSelectedSource} or double-click a row to jump to
-the node's source.
+the node's source. Double-clicking a subsystem or the project row opens a
+member file when the row itself has no location.
 
 Status chips in the panel header show whether the graph is indexing, ready,
 partial (truncated by budget), or in error. Use **Reindex**
@@ -106,8 +108,9 @@ and others). Other large workspaces should add their own file.
 
 - Cargo `workspace.members` globs such as `crates/*` are expanded; exclude
   lists and full Cargo glob parity are not guaranteed.
-- Structural edits (`Cargo.toml`, `semantic_map.toml`, files under `src/`)
-  trigger a debounced full reindex while the feature is enabled. Use
+- Structural edits (`Cargo.toml`, `Cargo.lock`, `semantic_map.toml`, crate-root
+  README files) trigger a debounced full reindex while the feature is enabled.
+  Editing files under `src/` does not. Use
   {#action semantic_map::Reindex} to rebuild immediately.
 
 ## Status {#status}
@@ -151,6 +154,7 @@ repository by default.
 
 > **Note:** With `intent.llm` enabled today, enrichment is still a no-op stub
 > until model routing lands. Static intents keep working either way.
+> `llm_on_visible_only` is stored but unused.
 
 ## Settings reference {#settings-reference}
 
@@ -159,13 +163,13 @@ repository by default.
 | `semantic_map.enabled`                          | `false` | Master gate for panel and canvas             |
 | `semantic_map.auto_open_canvas_on_project_open` | `false` | Open canvas when a project opens             |
 | `semantic_map.hide_external`                    | `true`  | Hide external dependency nodes               |
-| `semantic_map.hide_tests`                       | `true`  | Hide test-only modules and crates            |
+| `semantic_map.hide_tests`                       | `true`  | Hide modules flagged as tests (`*_test` / `*_tests` crate names). No-op if the extractor did not set the flag |
 | `semantic_map.module_depth`                     | `3`     | How deep to expand modules automatically     |
 | `semantic_map.max_auto_nodes`                   | `500`   | Soft cap before the graph is marked partial  |
-| `semantic_map.cluster.min_subsystems`           | `3`     | Soft minimum subsystem count when clustering |
+| `semantic_map.cluster.min_subsystems`           | `3`     | Stored only in Phase A; the clusterer does not use a minimum |
 | `semantic_map.cluster.max_subsystems`           | `16`    | Soft maximum subsystem count when clustering |
-| `semantic_map.intent.llm`                       | `false` | Opt into LLM intent enrichment               |
-| `semantic_map.intent.llm_on_visible_only`       | `true`  | Limit LLM requests to visible nodes          |
+| `semantic_map.intent.llm`                       | `false` | Opt into LLM intent enrichment (stub; no-op today) |
+| `semantic_map.intent.llm_on_visible_only`       | `true`  | Stored only in Phase A; the stub ignores it  |
 
 ## See Also {#see-also}
 

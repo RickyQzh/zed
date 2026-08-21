@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::{
     Edge, EdgeId, EdgeKind, GraphPatch, ModuleRef, Node, NodeFlags, NodeId, NodeKey, NodeKind,
-    SemanticGraph, SubsystemPayload,
+    SemanticGraph, SourceLocation, SubsystemPayload,
 };
 
 /// Clustering knobs (settings defaults: min 3, max 16).
@@ -75,8 +75,7 @@ struct RawModulePin {
 
 /// Parse repo-root `semantic_map.toml` into [`PinConfig`].
 pub fn load_pin_config(text: &str) -> Result<PinConfig> {
-    let raw: RawPinFile =
-        toml::from_str(text).context("failed to parse semantic_map.toml")?;
+    let raw: RawPinFile = toml::from_str(text).context("failed to parse semantic_map.toml")?;
     let mut subsystems: Vec<_> = raw
         .subsystems
         .into_iter()
@@ -192,7 +191,13 @@ pub fn cluster_subsystems(
         .max(1)
         .saturating_sub(pinned_slugs.len())
         .max(1);
-    assign_unpinned_by_prefix_or_other(graph, &top_modules, &unpinned, unpinned_budget, &mut assignment);
+    assign_unpinned_by_prefix_or_other(
+        graph,
+        &top_modules,
+        &unpinned,
+        unpinned_budget,
+        &mut assignment,
+    );
 
     // Ensure every top module is assigned.
     for &module_id in &top_modules {
@@ -228,21 +233,29 @@ pub fn cluster_subsystems(
         };
         let subsystem_id = NodeId::from_key(&subsystem_key);
         let pinned = members.iter().any(|id| pinned_modules.contains(id));
-        let cluster_score = if pinned { 1.0 } else { affinity_score(graph, &members) };
-        upsert_nodes.push(Node::subsystem(
-            subsystem_id,
-            subsystem_key,
-            slug.as_str(),
-            SubsystemPayload {
-                member_count: members.len() as u32,
-                cluster_score,
-                pinned,
-            },
-            NodeFlags {
-                user_pinned_subsystem: pinned,
-                ..NodeFlags::default()
-            },
-        ));
+        let cluster_score = if pinned {
+            1.0
+        } else {
+            affinity_score(graph, &members)
+        };
+        let location = first_member_location(graph, &members);
+        upsert_nodes.push(
+            Node::subsystem(
+                subsystem_id,
+                subsystem_key,
+                slug.as_str(),
+                SubsystemPayload {
+                    member_count: members.len() as u32,
+                    cluster_score,
+                    pinned,
+                },
+                NodeFlags {
+                    user_pinned_subsystem: pinned,
+                    ..NodeFlags::default()
+                },
+            )
+            .with_location(location),
+        );
         upsert_edges.push(Edge::contains(project_id, subsystem_id));
 
         for module_id in members {
@@ -263,6 +276,17 @@ pub fn cluster_subsystems(
         removed_edges,
         upsert_nodes,
         upsert_edges,
+    })
+}
+
+fn first_member_location(graph: &SemanticGraph, members: &[NodeId]) -> Option<SourceLocation> {
+    let mut members = members.to_vec();
+    members.sort();
+    members.iter().find_map(|module_id| {
+        graph
+            .nodes
+            .get(module_id)
+            .and_then(|node| node.location.clone())
     })
 }
 
@@ -444,20 +468,20 @@ mod tests {
     use worktree::WorktreeId;
 
     use super::{
-        cluster_subsystems, is_synthetic_subsystem_slug, load_pin_config, ClusterConfig, PinConfig,
-        PinnedSubsystem, OTHER_SUBSYSTEM_SLUG,
+        ClusterConfig, OTHER_SUBSYSTEM_SLUG, PinConfig, PinnedSubsystem, cluster_subsystems,
+        is_synthetic_subsystem_slug, load_pin_config,
     };
     use crate::{
         Edge, EdgeKind, GraphPatch, ModuleKind, ModulePayload, ModuleRef, Node, NodeFlags, NodeId,
-        NodeKey, NodeKind, SemanticGraph,
+        NodeKey, NodeKind, SemanticGraph, SourceLocation,
     };
 
     fn path_module(worktree_id: WorktreeId, path: &str, name: &str) -> Node {
-        let rel = RelPath::from_unix_str(path).unwrap();
+        let rel: Arc<RelPath> = RelPath::from_unix_str(path).unwrap().into();
         let key = NodeKey::Module {
             worktree_id,
             module_ref: ModuleRef::PathModule {
-                path: Arc::from(rel),
+                path: Arc::clone(&rel),
             },
         };
         let id = NodeId::from_key(&key);
@@ -465,7 +489,12 @@ mod tests {
             id,
             key,
             name,
-            None,
+            Some(SourceLocation {
+                worktree_id,
+                path: rel,
+                range: None,
+                symbol: None,
+            }),
             ModulePayload {
                 language: None,
                 module_kind: ModuleKind::Folder,
@@ -632,7 +661,14 @@ subsystem = "agent"
         // Dense DependsOn mesh used to agglomerate into subsystem-N plus
         // leftover crate-named singletons. Pins first; leftovers → other.
         let (mut graph, ids) = graph_with_modules(
-            &["gpui", "editor", "project", "agent", "which_key", "ztracing"],
+            &[
+                "gpui",
+                "editor",
+                "project",
+                "agent",
+                "which_key",
+                "ztracing",
+            ],
             &[
                 ("editor", "gpui"),
                 ("project", "gpui"),
@@ -697,7 +733,10 @@ subsystem = "agent"
             "got {slugs:?}"
         );
         assert!(slugs.contains(&"gpui".to_string()), "{slugs:?}");
-        assert!(slugs.contains(&OTHER_SUBSYSTEM_SLUG.to_string()), "{slugs:?}");
+        assert!(
+            slugs.contains(&OTHER_SUBSYSTEM_SLUG.to_string()),
+            "{slugs:?}"
+        );
 
         let gpui_members = subsystem_members(&graph, "gpui");
         assert!(gpui_members.contains(&ids["gpui"]));
@@ -747,5 +786,25 @@ subsystem = "agent"
             subsystem_members(&graph, OTHER_SUBSYSTEM_SLUG).contains(&ids["solo"]),
             "true singletons belong in other"
         );
+    }
+
+    #[test]
+    fn subsystem_location_comes_from_member_modules() {
+        let (mut graph, _) = graph_with_modules(&["gpui", "gpui_macros", "editor"], &[]);
+        cluster_and_apply(&mut graph, ClusterConfig::default(), &PinConfig::default());
+
+        let subsystems: Vec<_> = graph
+            .nodes
+            .values()
+            .filter(|node| node.kind == NodeKind::Subsystem)
+            .collect();
+        assert!(!subsystems.is_empty(), "expected clustered subsystems");
+        for node in subsystems {
+            assert!(
+                node.location.is_some(),
+                "subsystem {} should have a location when members have locations",
+                node.display_name
+            );
+        }
     }
 }

@@ -107,18 +107,23 @@ impl SemanticMapItem {
     }
 
     fn lens_from_settings(settings: &SemanticMapSettings) -> Lens {
-        Lens {
-            hide_external: settings.hide_external,
-            hide_tests: settings.hide_tests,
-            max_depth: Some(settings.module_depth as u32),
-            ..Lens::default()
-        }
+        crate::orientation_lens(
+            settings.hide_external,
+            settings.hide_tests,
+            settings.module_depth as u32,
+        )
     }
 
     fn refresh_view_model(&mut self, cx: &mut Context<Self>) {
         let settings = SemanticMapSettings::get_global(cx);
         let lens = Self::lens_from_settings(settings);
         let snapshot = self.project.read(cx).semantic_graph().read(cx).snapshot();
+        if self.pins.is_empty() && !snapshot.graph.nodes.is_empty() {
+            let restored = load_pins_from_kvp(self.pins_key.as_deref(), &self.project, cx);
+            if !restored.is_empty() {
+                self.pins = restored;
+            }
+        }
         self.view_model =
             CanvasViewModel::from_snapshot_with_pins(&snapshot, &lens, Some(&self.pins));
         cx.notify();

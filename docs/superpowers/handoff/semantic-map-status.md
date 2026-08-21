@@ -2,7 +2,8 @@
 
 **Branch:** `cursor/semantic-map-design-281a`  
 **Design spec:** `docs/superpowers/specs/2026-08-08-semantic-map-design.md`  
-**Phase A plan:** `docs/superpowers/plans/2026-08-08-semantic-map-phase-a.md`  
+**Phase A plan:** `docs/superpowers/plans/2026-08-08-semantic-map-phase-a.md` (checkboxes stale; do not re-run)  
+**Phase A closeout:** `docs/superpowers/handoff/semantic-map-phase-a-closeout.md`  
 **User doc:** `docs/src/semantic-map.md`
 
 Phase lettering is **A → C → B**. Do not start Phase B until C is underway
@@ -46,7 +47,7 @@ free of a `project` crate dependency.
 3. `OpenCanvas` (or panel **Open Canvas**) opens a card canvas in the active pane; selection syncs with the panel. Pan by dragging the background. Scroll-wheel zooms (clamped ~0.4–2.5) around the pointer.
 4. Drag a card past ~3px to pin layout (workspace KVP). Small moves do not pin.
 5. Optional `semantic_map.toml` at repo root pins subsystem membership + optional `summary` intent.
-6. **Reindex** rebuilds the full graph (no incremental apply yet). Structural worktree edits (`Cargo.toml`, `semantic_map.toml`, `src/**/*.rs`, crate-root README) **auto-reindex** after a 500ms debounce while the feature is enabled.
+6. **Reindex** rebuilds the full graph (no incremental apply yet). Auto-reindex (500ms debounce, while enabled) runs only for `Cargo.toml`, `Cargo.lock`, `semantic_map.toml`, crate-root `README.md`/`README`, and when a worktree is added. Editing `src/**/*.rs` does **not** auto-reindex. Use **Reindex** to force a rebuild. Live path is still a **full** rebuild, not incremental `GraphPatch` apply. While `Indexing`, the last-good snapshot stays visible; a generation counter ignores stale builds. `reindex_semantic_graph` returns `bool` so the panel does not latch `has_reindexed` when no visible worktree exists.
 
 Disabled: panel shows “Enable semantic_map in settings…”. Actions that mutate
 the map no-op when disabled.
@@ -63,9 +64,9 @@ All under `semantic_map`. Master gate **`enabled: false`**.
 | `auto_open_canvas_on_project_open` | `false` |
 | `module_depth` | `3` |
 | `max_auto_nodes` | `500` (overflow → `GraphStatus::Partial`) |
-| `cluster.min_subsystems` / `max_subsystems` | `3` / `16` |
+| `cluster.min_subsystems` / `max_subsystems` | `3` / `16` (`min_subsystems` is **parsed but unused** by the clusterer; only `max_subsystems` is applied) |
 | `intent.llm` | `false` |
-| `intent.llm_on_visible_only` | `true` |
+| `intent.llm_on_visible_only` | `true` (**parsed but unused**; LLM provider is a no-op stub) |
 
 Repo pins: `semantic_map.toml` `[subsystems.<slug>] members = [...]` and
 optional `summary`. This Zed checkout **has a root `semantic_map.toml`**
@@ -84,11 +85,12 @@ other large workspaces.
 | `src/semantic_graph.rs` | Lib root (`[lib] path`); re-exports. No `mod.rs`. |
 | `src/ir.rs` | Graph IR, patches, lens, intents. |
 | `src/ids.rs` | `NodeId` / `EdgeId` hashing. |
-| `src/store.rs` | GPUI entity, snapshot, async full reindex, `nodes_for_path`. |
+| `src/store.rs` | GPUI entity, snapshot, async full reindex, `nodes_for_path`. Last-good graph stays visible while `Indexing`. |
+| `src/usability.rs` | Fixture + Zed-checkout dogfood tests (`max_auto_nodes` 500, depth 2). |
 | `src/invalidation.rs` | `build_initial_graph`, `BuildGraphOptions`, `GraphIndexer` test helper, path-scope enum. Live debounce is in `semantic_map_ui` (`should_reindex_path`). |
 | `src/extract.rs` | Extractor module root + re-exports. |
 | `src/extract/traits.rs` | `SemanticExtractor`, `FsExtractCtx`, `ExtractBudget`. |
-| `src/extract/cargo.rs` | Parse workspace/package; expand `workspace.members` globs (`crates/*`). **No `exclude` list.** |
+| `src/extract/cargo.rs` | Parse workspace/package; expand `workspace.members` globs (`crates/*`); resolve `{ path }` **and** `{ workspace = true }` via `[workspace.dependencies]` paths. **No `exclude` list.** |
 | `src/extract/rust_modules.rs` | Depth-limited `src/*.rs` / `src/*/` walk. **Does not parse `mod`.** |
 | `src/extract/generic.rs` | Non-Cargo thin folder map + README evidence. |
 | `src/extract/cluster.rs` | Prefix/affinity clusterer + `semantic_map.toml` pin parse/override. |
@@ -109,7 +111,7 @@ Not present (spec layout leftovers): `persist.rs`, `lens.rs`, `intent/cache.rs`,
 |------|----------------|
 | `src/semantic_map_ui.rs` | `init`: register settings + panel actions. |
 | `src/settings.rs` | `SemanticMapSettings` from `settings_content`. |
-| `src/panel.rs` | `actions!(semantic_map, [ToggleFocus, OpenSelectedSource, OpenCanvas, Reindex])`, `SemanticMapPanel`, first-index + Reindex, open source, **debounced auto-reindex**. |
+| `src/panel.rs` | `actions!(semantic_map, [ToggleFocus, OpenSelectedSource, OpenCanvas, Reindex])`, `SemanticMapPanel`, first-index + Reindex, open source (node location or Contains-child fallback), **debounced auto-reindex**. Default lens is Project/Subsystem/Module (`orientation_lens`). View → Semantic Map always toggles the panel; when the feature is off the panel shows the enable hint instead of a silent no-op. |
 | `src/selection.rs` | Window-local `SemanticMapSelection` shared by panel + canvas. |
 | `src/view_model.rs` | `PanelViewModel` / `CanvasViewModel` / `SceneNode` / `SceneEdge` from snapshot + `Lens`. |
 | `src/canvas.rs` | Canvas module root. |
@@ -151,7 +153,7 @@ Not present (spec layout leftovers): `persist.rs`, `lens.rs`, `intent/cache.rs`,
 
 5. Leave `intent.llm` **false**. Enabling it still does nothing (stub).
 
-6. After editing `Cargo.toml` / `semantic_map.toml` / `src/**/*.rs`, the panel debounces and auto-reindexes. Use **Reindex** to force a rebuild. Live path is still a **full** rebuild, not incremental `GraphPatch` apply.
+6. After editing `Cargo.toml` / `Cargo.lock` / `semantic_map.toml` / a crate-root README, the panel debounces and auto-reindexes. Editing files under `src/` does **not**. Use **Reindex** to force a rebuild. Live path is still a **full** rebuild, not incremental `GraphPatch` apply.
 
 ---
 
@@ -161,7 +163,8 @@ Be honest. If a gap looks freshly fixed, **verify in code** before re-implementi
 
 | Gap | Status at handoff time |
 |-----|------------------------|
-| **Auto-reindex** on worktree/`UpdatedEntries` / `Cargo.toml` edits | **Wired in the panel** (`should_reindex_path` + 500ms GPUI timer debounce on `WorktreeUpdatedEntries`). Still a full `reindex`, not incremental patches. `invalidation_scope_for_path` in `semantic_graph` is unused by the live scheduler — do not add a second scheduler in `Project` without deleting the panel one. |
+| **Auto-reindex** on worktree/`UpdatedEntries` / `Cargo.toml` edits | **Wired in the panel** (`should_reindex_path` + 500ms GPUI timer debounce on `WorktreeUpdatedEntries`). Triggers: `Cargo.toml`, `Cargo.lock`, `semantic_map.toml`, crate-root README, and `WorktreeAdded`. **Not** `src/**/*.rs`. Still a full `reindex`, not incremental patches. Last-good snapshot stays visible while `Indexing`. `invalidation_scope_for_path` in `semantic_graph` is unused by the live scheduler — do not add a second scheduler in `Project` without deleting the panel one. |
+| **`hide_tests`** | View/layout filter exists. Cargo extractor sets `NodeFlags.is_test` for `*_test` / `*_tests` / `tests` package names. Most workspace crates are not flagged. |
 | **LLM intent** | Stub in `llm_provider.rs`. No `language_model` routing, no cache file. |
 | **Remote / SSH extraction** | Store is created on remote projects, but extract runs **client-side on the local worktree root** via `reindex_semantic_graph`. No proto (`GetSemanticGraphSnapshot`, etc.). Spec §12 / A.5. |
 | **Full `mod` parse** | `rust_modules.rs` is FS walk only (`src/*.rs`, `src/*/`). Inline `mod foo;` / `#[path]` not modeled. Tree-sitter follow-up. |
@@ -187,33 +190,42 @@ without opening the diff first.
 
 ### Event wiring (reuse existing Zed types)
 
-Subscribe (do not invent a parallel edit log):
+Prefer `project::Event::BufferEdited { source }` (`crates/project/src/project.rs`,
+event ~428, emit ~4016) over per-buffer subscribe. `Project` already fans
+`language::BufferEvent::Edited { source: BufferEditSource::Agent }`.
 
-- `language::BufferEvent::Edited { source: BufferEditSource::Agent }` (`crates/language/src/buffer.rs`).
+Also available (later slices, not C0):
+
 - `action_log::ActionLog` — `changed_buffers`, `buffer_read` (`crates/action_log/src/action_log.rs`). Thread already owns `action_log`.
 - `Project::set_agent_location` / `Event::AgentLocationChanged` (`project.rs`).
 
-Map buffer paths → nodes with `SemanticGraphStore::nodes_for_path` (already
-tested). Walk to parent `Subsystem` via `Contains` / `graph.children`.
+Map buffer paths with `semantic_graph::ProjectPath { worktree_id, path: Arc<RelPath> }`
+→ `SemanticGraphStore::nodes_for_path` (`store.rs` ~189). Convert from
+`project::ProjectPath`; do not pass the project crate type into `semantic_graph`.
+Walk to parent `Subsystem` via `Contains` / `graph.children`.
 
-Keep heat state on a small entity (or extend `SemanticMapSelection`) that
-**both** canvas and Agent Panel can observe. Do not put agent heat on
-`SemanticGraph` IR.
+Keep heat state in `semantic_map_ui` (new overlay entity, or extend
+`selection.rs`). Both canvas and Agent Panel must observe it. Do **not** put
+agent heat on `SemanticGraph` IR.
 
 ### UI
 
-- **Heat:** nodes recently touched by agent fade ~30–60s (GPUI executor timers in tests, not `smol::Timer`).
-- **Pulse:** current `agent_location` target.
+- **Heat:** nodes recently touched by agent fade **30s** (pin this duration).
+  Tests: `cx.background_executor().timer`, not `smol::Timer`.
+- **Pulse:** current `agent_location` target (C3).
 - **Trail (optional, later):** edges between consecutively touched modules in one turn.
-- **Agent Panel card:** “Affected subsystems” + jump-to-node. Likely `crates/agent_ui` thread view — **read current panel layout before adding a dock widget**.
+- **Agent Panel card (C2):** “Affected subsystems” + jump-to-node.
+  Layout lives in `crates/agent_ui/src/conversation_view.rs` (ActionLog ~1254).
+  Use `Thread::action_log()`. Read that file before adding a dock widget.
 
-`SceneNode` has no `agent_heat` field yet (spec §7 mentioned it). Add on the
-**view model**, not the IR.
+`SceneNode` (`view_model.rs` ~64) has `id, kind, rect, title, subtitle` only.
+Add heat on the **view model**, not the IR.
 
 ### Read tools
 
-Add `AgentTool`s (see `crates/agent/src/thread.rs` `trait AgentTool`, register
-in `Thread::add_tool` next to `ReadFileTool` ~2140):
+Copy `crates/agent/src/tools/read_file_tool.rs`. Register in
+`Thread::add_default_tools` next to `ReadFileTool` (`crates/agent/src/thread.rs`
+~2140). The `AgentTool` trait is `thread.rs` ~5067.
 
 ```text
 semantic_map_overview(lens?) -> { subsystems: [{name, summary, modules[]}] }
@@ -233,18 +245,18 @@ panic. Encourage overview before large refactors (tool description).
 
 **C0 — heat from agent buffer edits only** (one PR):
 
-1. Overlay entity: `touched: HashMap<NodeId, Instant>` updated when
-   `BufferEvent::Edited` has `BufferEditSource::Agent`.
-2. Resolve path via `project` file → `semantic_graph::ProjectPath` →
-   `nodes_for_path`.
+1. Overlay entity in `semantic_map_ui`: `touched: HashMap<NodeId, Instant>`
+   updated on `project::Event::BufferEdited { source: BufferEditSource::Agent }`.
+2. Resolve path → `semantic_graph::ProjectPath` → `nodes_for_path`.
 3. Tint `SceneNode` / panel row while heat > 0; decay with
-   `cx.background_executor().timer`.
-4. Tests: fake Agent edit → node id in overlay; User edit → no heat.
+   `cx.background_executor().timer` (30s).
+4. Tests in `semantic_map_ui` GPUI tests: Agent edit → node id in overlay;
+   User edit → no heat.
 5. Do **not** in C0: Agent Panel card, trail, LLM, tools (C1),
    `semantic_map_overview` (C1).
 
-C1 (follow-up): two read tools + register in `Thread`.  
-C2: Agent Panel “Affected subsystems”.  
+C1: two read tools + register in `Thread`.  
+C2: Agent Panel “Affected subsystems” in `conversation_view.rs`.  
 C3: pulse + optional trail.
 
 ---
@@ -252,6 +264,11 @@ C3: pulse + optional trail.
 ## 6. Phase B plan (later agent) — do not implement now
 
 **Spec:** design §11. Milestones M8–M9. After C0 at least.
+
+**B0 first PR (do not start until C0 is underway unless a human reorders):**
+add `NodeKind::Design` to `ir.rs`, persist stubs in `.zed/semantic_design.json`,
+canvas stub cards. No codegen. `EdgeKind::DesignLinks` already exists;
+**there is no `DesignContains`** — add it when implementing if needed.
 
 ### B1 — Safe structural edits
 
@@ -271,7 +288,7 @@ Tag edits so they are auditable (`BufferEditSource` or analytics label).
 New IR usage (enums already reserved):
 
 - `NodeKind` needs `Design` (add when implementing; **not** on the enum today — verify `ir.rs`).
-- `EdgeKind::DesignLinks` / `DesignContains`.
+- `EdgeKind::DesignLinks` exists. Add `DesignContains` only if the B2 model needs it.
 
 Persist in **`.zed/semantic_design.json`** (git-reviewable). Workflow: draw
 Design → link to Module or leave unimplemented → “Implement selection” hands
@@ -289,11 +306,13 @@ cargo test -p semantic_map_ui --lib
 cargo check -p zed
 ```
 
+Re-run these; do not trust stale pass counts. Last closeout was ~38 `semantic_graph` + ~19 `semantic_map_ui` before the workspace-dep / orientation-lens / location work.
+
 Useful fixtures/tests:
 
-- `semantic_graph`: cargo glob members, cluster pins, `nodes_for_path`, reindex Indexing→Idle / Partial, static intents, rust module walk, invalidation scope classification.
-- `semantic_map_ui`: settings defaults (`enabled == false`, `intent.llm == false`), panel GPUI test, canvas pin-threshold / zoom / double-click classification tests, view-model collectors, `should_reindex_path`.
-- Dogfood: `build_initial_graph` on this Zed checkout (`max_auto_nodes` 500, depth 2) must stay green (`gpui` / `editor` / `project` modules present).
+- `semantic_graph`: cargo glob members, `{ workspace = true }` DependsOn, cluster pins, `nodes_for_path`, reindex Indexing→Idle / Partial / last-good snapshot, static intents, rust module walk.
+- `semantic_map_ui`: settings defaults (`enabled == false`, `intent.llm == false`), `orientation_lens` hides Entry, panel GPUI tests, canvas pin-threshold / zoom / double-click classification, `should_reindex_path`, source-location fallback.
+- Dogfood: `dogfood_zed_workspace_indexes_well_known_crates` — product-area pins, Contains membership (`editing`→`editor`, …), `DependsOn(editor → gpui)`, README Project intent, no `subsystem-N`.
 
 GPUI tests: use `cx.background_executor().timer(...)`, not `smol::Timer`.
 

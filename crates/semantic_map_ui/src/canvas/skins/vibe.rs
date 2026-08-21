@@ -1,4 +1,4 @@
-use gpui::{Hsla, App};
+use gpui::{App, Hsla};
 use semantic_graph::NodeKind;
 use ui::prelude::*;
 
