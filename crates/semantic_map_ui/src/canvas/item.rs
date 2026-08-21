@@ -1,13 +1,15 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use db::kvp::KeyValueStore;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Point, Render,
-    SharedString, Styled, Subscription, Task, Window, div, point, px,
+    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription, Task,
+    WeakEntity, Window, div, point, px,
 };
 use project::Project;
-use semantic_graph::{
-    CanvasPins, EdgeKind, Lens, NodeId, SemanticGraphEvent, canvas_pins_kvp_key,
-};
+use semantic_graph::{CanvasPins, EdgeKind, Lens, NodeId, SemanticGraphEvent, canvas_pins_kvp_key};
 use settings::{Settings, SettingsStore};
 use ui::{Color, Label, LabelSize, prelude::*};
 use util::{ResultExt as _, TryFutureExt as _};
@@ -16,14 +18,18 @@ use workspace::{
     item::{Item, ItemEvent},
 };
 
+use crate::panel;
+
 /// Screen-space threshold: movement below this is treated as a click (select only, no pin).
 const PIN_DRAG_THRESHOLD_PX: f32 = 3.0;
+const MIN_ZOOM: f32 = 0.4;
+const MAX_ZOOM: f32 = 2.5;
+const WHEEL_ZOOM_LINE_FACTOR: f32 = 1.08;
+const WHEEL_ZOOM_PIXEL_SCALE: f32 = 0.01;
 
 use super::element::SemanticMapCanvasElement;
 use super::skins::vibe::VibeSkin;
-use crate::{
-    CanvasViewModel, SceneNode, SemanticMapSelection, SemanticMapSettings,
-};
+use crate::{CanvasViewModel, SceneNode, SemanticMapSelection, SemanticMapSettings};
 
 struct NodeDrag {
     node_id: NodeId,
@@ -33,6 +39,7 @@ struct NodeDrag {
 
 pub struct SemanticMapItem {
     project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
     selection: Entity<SemanticMapSelection>,
     focus_handle: FocusHandle,
     view_model: CanvasViewModel,
@@ -40,6 +47,7 @@ pub struct SemanticMapItem {
     pins_key: Option<String>,
     pan: Point<f32>,
     zoom: f32,
+    viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     panning: Option<Point<f32>>,
     pan_anchor: Point<f32>,
     node_drag: Option<NodeDrag>,
@@ -50,6 +58,7 @@ pub struct SemanticMapItem {
 impl SemanticMapItem {
     pub fn new(
         project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
         selection: Entity<SemanticMapSelection>,
         pins_key: Option<String>,
         cx: &mut App,
@@ -60,14 +69,13 @@ impl SemanticMapItem {
             let pins = load_pins_from_kvp(pins_key.as_deref(), &project, cx);
 
             let mut subscriptions = Vec::new();
-            subscriptions.push(cx.subscribe(
-                &semantic_graph,
-                |this: &mut Self, _, event, cx| {
+            subscriptions.push(
+                cx.subscribe(&semantic_graph, |this: &mut Self, _, event, cx| {
                     if matches!(event, SemanticGraphEvent::Updated { .. }) {
                         this.refresh_view_model(cx);
                     }
-                },
-            ));
+                }),
+            );
             subscriptions.push(cx.observe(&selection, |_, _, cx| {
                 cx.notify();
             }));
@@ -78,6 +86,7 @@ impl SemanticMapItem {
 
             let mut this = Self {
                 project: project.clone(),
+                workspace,
                 selection,
                 focus_handle,
                 view_model: CanvasViewModel::default(),
@@ -85,6 +94,7 @@ impl SemanticMapItem {
                 pins_key,
                 pan: point(24.0, 24.0),
                 zoom: 1.0,
+                viewport_bounds: Rc::new(Cell::new(None)),
                 panning: None,
                 pan_anchor: point(0.0, 0.0),
                 node_drag: None,
@@ -119,6 +129,10 @@ impl SemanticMapItem {
             selection.select([node_id], cx);
         });
         cx.notify();
+    }
+
+    fn open_card_source(&self, node_id: NodeId, window: &mut Window, cx: &mut Context<Self>) {
+        panel::open_node_source(&self.workspace, &self.project, node_id, window, cx);
     }
 
     fn start_pan(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -173,11 +187,7 @@ impl SemanticMapItem {
             return;
         };
         let current = point::<f32>(event.position.x.into(), event.position.y.into());
-        let zoom = if self.zoom.abs() < f32::EPSILON {
-            1.0
-        } else {
-            self.zoom
-        };
+        let zoom = effective_zoom(self.zoom);
         let world = point(
             drag.origin.x + (current.x - drag.start_screen.x) / zoom,
             drag.origin.y + (current.y - drag.start_screen.y) / zoom,
@@ -216,7 +226,7 @@ impl SemanticMapItem {
         cx.notify();
     }
 
-    fn end_node_drag(&mut self, cx: &mut Context<Self>) {
+    fn end_node_drag(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(drag) = self.node_drag.take() else {
             return;
         };
@@ -229,32 +239,78 @@ impl SemanticMapItem {
             return;
         };
         let position = (node.rect.origin.x, node.rect.origin.y);
-        let zoom = if self.zoom.abs() < f32::EPSILON {
-            1.0
-        } else {
-            self.zoom
-        };
+        let zoom = effective_zoom(self.zoom);
         let screen_dx = (position.0 - drag.origin.x) * zoom;
         let screen_dy = (position.1 - drag.origin.y) * zoom;
-        // Click (no meaningful move): selection already applied on mouse-down; do not pin.
-        if screen_dx * screen_dx + screen_dy * screen_dy
-            <= PIN_DRAG_THRESHOLD_PX * PIN_DRAG_THRESHOLD_PX
-        {
-            self.refresh_view_model(cx);
+        match classify_card_release(event.click_count, screen_dx, screen_dy) {
+            CardReleaseAction::SelectOnly => {
+                self.refresh_view_model(cx);
+            }
+            CardReleaseAction::OpenSource => {
+                self.refresh_view_model(cx);
+                self.open_card_source(drag.node_id, window, cx);
+            }
+            CardReleaseAction::Pin => {
+                let snapshot = self.project.read(cx).semantic_graph().read(cx).snapshot();
+                let Some(key) = snapshot
+                    .graph
+                    .nodes
+                    .get(&drag.node_id)
+                    .map(|node| node.key.clone())
+                else {
+                    return;
+                };
+                self.pins.pin(key, position);
+                self.persist_pins(cx);
+                self.refresh_view_model(cx);
+            }
+        }
+    }
+
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let factor = zoom_factor_from_delta(event.delta);
+        if (factor - 1.0).abs() < f32::EPSILON {
             return;
         }
-        let snapshot = self.project.read(cx).semantic_graph().read(cx).snapshot();
-        let Some(key) = snapshot
-            .graph
-            .nodes
-            .get(&drag.node_id)
-            .map(|node| node.key.clone())
-        else {
+        let origin = self.zoom_origin_local(event.position);
+        self.apply_zoom(self.zoom * factor, origin, cx);
+    }
+
+    fn zoom_origin_local(&self, cursor: Point<Pixels>) -> Point<f32> {
+        match self.viewport_bounds.get() {
+            Some(bounds) => {
+                let local = point(
+                    f32::from(cursor.x - bounds.origin.x),
+                    f32::from(cursor.y - bounds.origin.y),
+                );
+                let width = f32::from(bounds.size.width);
+                let height = f32::from(bounds.size.height);
+                let inside =
+                    local.x >= 0.0 && local.y >= 0.0 && local.x <= width && local.y <= height;
+                if inside {
+                    local
+                } else {
+                    point(width / 2.0, height / 2.0)
+                }
+            }
+            None => point(0.0, 0.0),
+        }
+    }
+
+    fn apply_zoom(&mut self, new_zoom: f32, origin_local: Point<f32>, cx: &mut Context<Self>) {
+        let old_zoom = effective_zoom(self.zoom);
+        let new_zoom = clamp_zoom(new_zoom);
+        if (new_zoom - self.zoom).abs() < f32::EPSILON {
             return;
-        };
-        self.pins.pin(key, position);
-        self.persist_pins(cx);
-        self.refresh_view_model(cx);
+        }
+        self.pan = zoom_pan_preserving_origin(self.pan, old_zoom, new_zoom, origin_local);
+        self.zoom = new_zoom;
+        cx.notify();
     }
 
     fn persist_pins(&mut self, cx: &mut Context<Self>) {
@@ -368,32 +424,88 @@ impl SemanticMapItem {
             .map(|id| i64::from(id).to_string())
             .or_else(|| workspace.session_id())
             .map(canvas_pins_kvp_key);
-        let item = SemanticMapItem::new(project, selection, pins_key, cx);
+        let item = SemanticMapItem::new(project, workspace.weak_handle(), selection, pins_key, cx);
         pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(item), true, true, None, window, cx);
         });
     }
 }
 
-fn load_pins_from_kvp(
-    pins_key: Option<&str>,
-    project: &Entity<Project>,
-    cx: &App,
-) -> CanvasPins {
+fn load_pins_from_kvp(pins_key: Option<&str>, project: &Entity<Project>, cx: &App) -> CanvasPins {
     let Some(key) = pins_key else {
         return CanvasPins::default();
     };
-    let Some(json) = KeyValueStore::global(cx)
-        .read_kvp(key)
-        .log_err()
-        .flatten()
-    else {
+    let Some(json) = KeyValueStore::global(cx).read_kvp(key).log_err().flatten() else {
         return CanvasPins::default();
     };
     let snapshot = project.read(cx).semantic_graph().read(cx).snapshot();
     CanvasPins::from_json(&json, &snapshot.graph)
         .log_err()
         .unwrap_or_default()
+}
+
+fn effective_zoom(zoom: f32) -> f32 {
+    if zoom.abs() < f32::EPSILON { 1.0 } else { zoom }
+}
+
+fn clamp_zoom(zoom: f32) -> f32 {
+    zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn zoom_factor_from_delta(delta: ScrollDelta) -> f32 {
+    match delta {
+        ScrollDelta::Pixels(pixels) => {
+            let signed = f32::from(pixels.y);
+            if signed.abs() < f32::EPSILON {
+                1.0
+            } else if signed > 0.0 {
+                1.0 + signed.abs() * WHEEL_ZOOM_PIXEL_SCALE
+            } else {
+                1.0 / (1.0 + signed.abs() * WHEEL_ZOOM_PIXEL_SCALE)
+            }
+        }
+        ScrollDelta::Lines(lines) => {
+            if lines.y.abs() < f32::EPSILON {
+                1.0
+            } else {
+                WHEEL_ZOOM_LINE_FACTOR.powf(lines.y)
+            }
+        }
+    }
+}
+
+/// Keep the world point under `origin` fixed when zoom changes.
+/// Screen mapping: `screen = logical * zoom + pan`.
+fn zoom_pan_preserving_origin(
+    pan: Point<f32>,
+    old_zoom: f32,
+    new_zoom: f32,
+    origin: Point<f32>,
+) -> Point<f32> {
+    let old_zoom = effective_zoom(old_zoom);
+    let world = point((origin.x - pan.x) / old_zoom, (origin.y - pan.y) / old_zoom);
+    point(origin.x - world.x * new_zoom, origin.y - world.y * new_zoom)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardReleaseAction {
+    SelectOnly,
+    OpenSource,
+    Pin,
+}
+
+fn classify_card_release(click_count: usize, screen_dx: f32, screen_dy: f32) -> CardReleaseAction {
+    let distance_sq = screen_dx * screen_dx + screen_dy * screen_dy;
+    let threshold_sq = PIN_DRAG_THRESHOLD_PX * PIN_DRAG_THRESHOLD_PX;
+    if distance_sq <= threshold_sq {
+        if click_count > 1 {
+            CardReleaseAction::OpenSource
+        } else {
+            CardReleaseAction::SelectOnly
+        }
+    } else {
+        CardReleaseAction::Pin
+    }
 }
 
 impl EventEmitter<ItemEvent> for SemanticMapItem {}
@@ -450,9 +562,9 @@ impl Render for SemanticMapItem {
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
                             if this.node_drag.is_some() {
-                                this.end_node_drag(cx);
+                                this.end_node_drag(event, window, cx);
                             } else {
                                 this.end_pan(cx);
                             }
@@ -464,10 +576,15 @@ impl Render for SemanticMapItem {
                             this.end_pan(cx);
                         }),
                     )
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                        this.handle_scroll_wheel(event, window, cx);
+                        cx.stop_propagation();
+                    }))
                     .child(SemanticMapCanvasElement::new(
                         self.view_model.edges.clone(),
                         self.pan,
                         self.zoom,
+                        self.viewport_bounds.clone(),
                     ))
                     .children(self.view_model.nodes.iter().map(|node| {
                         let is_selected = selected.contains(&node.id);
@@ -570,15 +687,13 @@ mod tests {
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings
-                        .semantic_map
-                        .get_or_insert_default()
-                        .enabled = Some(true);
+                    settings.semantic_map.get_or_insert_default().enabled = Some(true);
                 });
             });
         });
 
-        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = window
             .read_with(cx, |mw, _| mw.workspace().clone())
             .unwrap();
@@ -608,5 +723,49 @@ mod tests {
                     .is_some()
             );
         });
+    }
+
+    #[test]
+    fn clamp_zoom_respects_range() {
+        assert_eq!(clamp_zoom(0.1), MIN_ZOOM);
+        assert_eq!(clamp_zoom(3.0), MAX_ZOOM);
+        assert_eq!(clamp_zoom(1.0), 1.0);
+        assert_eq!(clamp_zoom(0.4), MIN_ZOOM);
+        assert_eq!(clamp_zoom(2.5), MAX_ZOOM);
+    }
+
+    #[test]
+    fn classify_card_release_double_click_opens_source() {
+        assert_eq!(
+            classify_card_release(2, 0.0, 0.0),
+            CardReleaseAction::OpenSource
+        );
+        assert_eq!(
+            classify_card_release(3, 1.0, 1.0),
+            CardReleaseAction::OpenSource
+        );
+        assert_eq!(
+            classify_card_release(1, 0.0, 0.0),
+            CardReleaseAction::SelectOnly
+        );
+        assert_eq!(
+            classify_card_release(1, PIN_DRAG_THRESHOLD_PX, 0.0),
+            CardReleaseAction::SelectOnly
+        );
+        assert_eq!(classify_card_release(2, 10.0, 0.0), CardReleaseAction::Pin);
+        assert_eq!(classify_card_release(1, 4.0, 0.0), CardReleaseAction::Pin);
+    }
+
+    #[test]
+    fn zoom_around_origin_keeps_world_point() {
+        let pan = point(24.0, 24.0);
+        let origin = point(100.0, 80.0);
+        let new_pan = zoom_pan_preserving_origin(pan, 1.0, 2.0, origin);
+        assert_eq!(new_pan, point(-52.0, -32.0));
+
+        let world_before = point((origin.x - pan.x) / 1.0, (origin.y - pan.y) / 1.0);
+        let world_after = point((origin.x - new_pan.x) / 2.0, (origin.y - new_pan.y) / 2.0);
+        assert!((world_before.x - world_after.x).abs() < f32::EPSILON);
+        assert!((world_before.y - world_after.y).abs() < f32::EPSILON);
     }
 }

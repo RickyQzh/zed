@@ -4,9 +4,10 @@
 //! [`SemanticMapCanvasElement`] paints DependsOn (and other) edge polylines
 //! with a thin `canvas` overlay.
 
-use gpui::{
-    App, Bounds, IntoElement, PathBuilder, Pixels, Point, Window, canvas, point, px,
-};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui::{App, Bounds, IntoElement, PathBuilder, Pixels, Point, Window, canvas, point, px};
 use ui::prelude::*;
 
 use super::skins::vibe::VibeSkin;
@@ -18,11 +19,22 @@ pub struct SemanticMapCanvasElement {
     edges: Vec<SceneEdge>,
     pan: Point<f32>,
     zoom: f32,
+    viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl SemanticMapCanvasElement {
-    pub fn new(edges: Vec<SceneEdge>, pan: Point<f32>, zoom: f32) -> Self {
-        Self { edges, pan, zoom }
+    pub fn new(
+        edges: Vec<SceneEdge>,
+        pan: Point<f32>,
+        zoom: f32,
+        viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    ) -> Self {
+        Self {
+            edges,
+            pan,
+            zoom,
+            viewport_bounds,
+        }
     }
 }
 
@@ -31,10 +43,13 @@ impl RenderOnce for SemanticMapCanvasElement {
         let edges = self.edges;
         let pan = self.pan;
         let zoom = self.zoom;
+        let viewport_bounds = self.viewport_bounds;
         let color = VibeSkin::edge_color(cx);
 
         canvas(
-            move |_, _, _| {},
+            move |bounds, _, _| {
+                viewport_bounds.set(Some(bounds));
+            },
             move |bounds, _, window, _cx| {
                 for edge in &edges {
                     if edge.routed_path.len() < 2 {
