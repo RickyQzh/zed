@@ -52,11 +52,12 @@ partial (truncated by budget), or in error. Use **Reindex**
 Open the spatial canvas with {#action semantic_map::OpenCanvas}, or click
 **Open Canvas** in the panel.
 
-The canvas lays out nodes as cards with dependency edges. Pan to explore
-(Phase A has no zoom controls). Select a card to sync selection with the
-panel. The canvas does not open files on double-click—select a card, then
-use {#action semantic_map::OpenSelectedSource} or open the node from the
-panel when a location is available.
+The canvas lays out nodes as cards with dependency edges. Pan by dragging
+the background. Scroll to zoom around the pointer, or around the canvas
+center when the pointer is outside the viewport. Double-click a card to
+open its source when a location is available. Select a card to sync
+selection with the panel. You can also use
+{#action semantic_map::OpenSelectedSource} after selecting a card.
 
 To open the canvas automatically when a project opens:
 
@@ -99,9 +100,27 @@ static intent on the map.
 
 ## Phase A limitations {#phase-a-limitations}
 
-- Canvas navigation is pan-only (no wheel/UI zoom yet).
 - Cargo `workspace.members` globs such as `crates/*` are expanded; exclude
   lists and full Cargo glob parity are not guaranteed.
+- The map does not rebuild when you edit files. Use
+  {#action semantic_map::Reindex} after large project or
+  `semantic_map.toml` changes.
+
+## Status {#status}
+
+Semantic Map is experimental Phase A. It is off by default. You enable it to
+browse subsystems and jump to source. Agent highlighting and diagram edits are
+not available.
+
+## What's next {#whats-next}
+
+Later work:
+
+- Agent co-view (Phase C): highlight map nodes the agent is editing.
+- Diagram-driven design (Phase B): structural edits and design nodes from the
+  map.
+
+Those features are not in this release.
 
 ## Privacy and intent {#privacy}
 

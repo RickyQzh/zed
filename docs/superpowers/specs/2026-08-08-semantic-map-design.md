@@ -1,7 +1,7 @@
 # Semantic Map Design
 
 **Date:** 2026-08-08  
-**Status:** Phase A implementation planned  
+**Status:** Phase A implemented on this branch (experimental, default off). Agent handoff: [`docs/superpowers/handoff/semantic-map-status.md`](../handoff/semantic-map-status.md).
 **Working title:** Semantic Map — project-structure visualization for vibe coding on Zed  
 **Primary crates (proposed):** `semantic_graph`, `semantic_map_ui`
 
