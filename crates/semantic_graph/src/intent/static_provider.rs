@@ -358,6 +358,7 @@ fn project_readme_intent(root: &Path, node: &Node, updated_at: Timestamp) -> Res
         excerpt: SharedString::from(excerpt),
         weight: 1.0,
     }];
+    let content_hash = hash_evidence(&evidence);
     Ok(Some(Intent {
         subject: node.id,
         summary: SharedString::from(summary),
@@ -366,7 +367,7 @@ fn project_readme_intent(root: &Path, node: &Node, updated_at: Timestamp) -> Res
         source: IntentSource::Static,
         evidence,
         updated_at,
-        content_hash: hash_evidence(&evidence),
+        content_hash,
     }))
 }
 

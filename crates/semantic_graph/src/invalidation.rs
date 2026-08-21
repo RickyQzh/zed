@@ -614,8 +614,7 @@ mod tests {
         let truncated = enforce_max_auto_nodes(&mut graph, &mut intents, 3).unwrap();
         assert!(truncated);
         assert_eq!(graph.nodes.len(), 3);
-        let kinds: std::collections::BTreeSet<_> =
-            graph.nodes.values().map(|node| node.kind).collect();
+        let kinds: Vec<NodeKind> = graph.nodes.values().map(|node| node.kind).collect();
         assert!(kinds.contains(&NodeKind::Project));
         assert!(kinds.contains(&NodeKind::Subsystem));
         assert!(kinds.contains(&NodeKind::Module));
