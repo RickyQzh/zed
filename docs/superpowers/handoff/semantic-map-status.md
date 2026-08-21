@@ -31,7 +31,7 @@ repo, see subsystems/modules + short static “what this does”, jump to source
 - **IR** (`ir.rs`): `Node`, `NodeKind` (`Project`, `Subsystem`, `Module`, `Entry`, `Type`, `External`), `NodeKey` / `ModuleRef`, `Edge` / `EdgeKind` (`Contains`, `DependsOn`, `Exposes`, `Implements`, `Calls`, `References`, `DesignLinks`), `SemanticGraph`, `GraphPatch`, `GraphRevision`, `Lens`, `Intent`, `Evidence`, `SourceLocation`.
 - **IDs** (`ids.rs`): `NodeId` / `EdgeId` from `FxHasher` over keys. Process-stable, not a cross-language digest.
 - **Store** (`store.rs`): `SemanticGraphStore`, `SemanticGraphSnapshot`, `GraphStatus` (`Idle`, `Indexing`, `Partial`, `Error`), `SemanticGraphEvent::Updated`, `reindex`, `apply_patch`, `nodes_for_path` (path → node ids; Phase C hook).
-- **Build** (`invalidation.rs`): `BuildGraphOptions`, `build_initial_graph` (Cargo or generic → rust modules → **cluster then trim** → static intents → LLM stub). `invalidation_scope_for_path` classifies dirty paths; **not wired to worktree events**.
+- **Build** (`invalidation.rs`): `BuildGraphOptions`, `build_initial_graph` (Cargo or generic → rust modules → **cluster then trim** → static intents → LLM stub). `invalidation_scope_for_path` classifies dirty paths; live debounce lives in `semantic_map_ui` (`should_reindex_path`).
 - **Extractors** (`extract/`): Cargo workspace, rust module FS walk, generic thin folders, subsystem cluster + `semantic_map.toml` pins.
 - **Intent** (`intent/`): `StaticIntentProvider` (crate description / README / pin `summary`); `LlmIntentProvider` **stub** (always empty).
 - **Layout** (`layout/`): hierarchy grid + `CanvasPins` (workspace KVP, not repo toml).
@@ -42,11 +42,11 @@ free of a `project` crate dependency.
 ### User flows (when `semantic_map.enabled` is true)
 
 1. Open Semantic Map panel → first time indexes visible worktree; list of nodes + intent chips; status Ready / Indexing / Partial / Error.
-2. Click row to select; `OpenSelectedSource` or double-click a panel row opens source when `SourceLocation` exists. Canvas double-click: verify `canvas/item.rs` (landing on this branch).
-3. `OpenCanvas` (or panel **Open Canvas**) opens a card canvas in the active pane; selection syncs with the panel. Pan by dragging the background.
-4. Drag a card past ~3px to pin layout (workspace KVP). Small moves do not pin. Wheel zoom and double-click-to-open are **landing on this branch** — verify `canvas/item.rs` / user doc before treating them as missing.
+2. Click row to select; `OpenSelectedSource` or double-click a panel row opens source when `SourceLocation` exists. Double-click a canvas card (below pin-drag threshold) also opens source.
+3. `OpenCanvas` (or panel **Open Canvas**) opens a card canvas in the active pane; selection syncs with the panel. Pan by dragging the background. Scroll-wheel zooms (clamped ~0.4–2.5) around the pointer.
+4. Drag a card past ~3px to pin layout (workspace KVP). Small moves do not pin.
 5. Optional `semantic_map.toml` at repo root pins subsystem membership + optional `summary` intent.
-6. **Reindex** rebuilds the full graph (no incremental apply yet).
+6. **Reindex** rebuilds the full graph (no incremental apply yet). Structural worktree edits (`Cargo.toml`, `semantic_map.toml`, `src/**/*.rs`, crate-root README) **auto-reindex** after a 500ms debounce while the feature is enabled.
 
 Disabled: panel shows “Enable semantic_map in settings…”. Actions that mutate
 the map no-op when disabled.
@@ -82,7 +82,7 @@ optional `summary`.
 | `src/ir.rs` | Graph IR, patches, lens, intents. |
 | `src/ids.rs` | `NodeId` / `EdgeId` hashing. |
 | `src/store.rs` | GPUI entity, snapshot, async full reindex, `nodes_for_path`. |
-| `src/invalidation.rs` | `build_initial_graph`, `BuildGraphOptions`, `GraphIndexer` test helper, path-scope enum (unused by live events). |
+| `src/invalidation.rs` | `build_initial_graph`, `BuildGraphOptions`, `GraphIndexer` test helper, path-scope enum. Live debounce is in `semantic_map_ui` (`should_reindex_path`). |
 | `src/extract.rs` | Extractor module root + re-exports. |
 | `src/extract/traits.rs` | `SemanticExtractor`, `FsExtractCtx`, `ExtractBudget`. |
 | `src/extract/cargo.rs` | Parse workspace/package; expand `workspace.members` globs (`crates/*`). **No `exclude` list.** |
@@ -106,11 +106,11 @@ Not present (spec layout leftovers): `persist.rs`, `lens.rs`, `intent/cache.rs`,
 |------|----------------|
 | `src/semantic_map_ui.rs` | `init`: register settings + panel actions. |
 | `src/settings.rs` | `SemanticMapSettings` from `settings_content`. |
-| `src/panel.rs` | `actions!(semantic_map, [ToggleFocus, OpenSelectedSource, OpenCanvas, Reindex])`, `SemanticMapPanel`, first-index + Reindex, open source. |
+| `src/panel.rs` | `actions!(semantic_map, [ToggleFocus, OpenSelectedSource, OpenCanvas, Reindex])`, `SemanticMapPanel`, first-index + Reindex, open source, **debounced auto-reindex**. |
 | `src/selection.rs` | Window-local `SemanticMapSelection` shared by panel + canvas. |
 | `src/view_model.rs` | `PanelViewModel` / `CanvasViewModel` / `SceneNode` / `SceneEdge` from snapshot + `Lens`. |
 | `src/canvas.rs` | Canvas module root. |
-| `src/canvas/item.rs` | `SemanticMapItem` pane item: pan, drag-to-pin, selection, KVP pin load/save. Wheel zoom + double-click open **in progress on this branch** — verify before editing. |
+| `src/canvas/item.rs` | `SemanticMapItem` pane item: pan, wheel zoom, drag-to-pin, double-click open source, selection, KVP pin load/save. |
 | `src/canvas/element.rs` | Custom GPUI element for edges. |
 | `src/canvas/skins.rs` | Skin module root. |
 | `src/canvas/skins/vibe.rs` | Default card chrome. No `c4.rs` / `uml.rs`. |
@@ -139,8 +139,8 @@ Not present (spec layout leftovers): `persist.rs`, `lens.rs`, `intent/cache.rs`,
 2. Command palette / View menu:
    - `semantic_map::ToggleFocus` — dock panel (indexes on first focus/open when enabled).
    - `semantic_map::OpenCanvas` — pane canvas.
-   - `semantic_map::OpenSelectedSource` — jump to selected node’s file. Canvas double-click may also open source (verify `item.rs`).
-   - `semantic_map::Reindex` — full rebuild. Also a **Reindex** button in the panel header.
+   - `semantic_map::OpenSelectedSource` — jump to selected node’s file. Canvas card double-click also opens source.
+   - `semantic_map::Reindex` — full rebuild. Also a **Reindex** button in the panel header. Structural file changes auto-reindex (debounced).
 
 3. Fixture: open `crates/semantic_graph/test_data/simple_workspace`. Expect `app` / `core_lib`, DependsOn, crate-description intents.
 
@@ -148,7 +148,7 @@ Not present (spec layout leftovers): `persist.rs`, `lens.rs`, `intent/cache.rs`,
 
 5. Leave `intent.llm` **false**. Enabling it still does nothing (stub).
 
-6. After editing `Cargo.toml` / `semantic_map.toml` / lots of files, click **Reindex**. The graph does not follow worktree events yet.
+6. After editing `Cargo.toml` / `semantic_map.toml` / `src/**/*.rs`, the panel debounces and auto-reindexes. Use **Reindex** to force a rebuild. Live path is still a **full** rebuild, not incremental `GraphPatch` apply.
 
 ---
 
@@ -158,7 +158,7 @@ Be honest. If a gap looks freshly fixed, **verify in code** before re-implementi
 
 | Gap | Status at handoff time |
 |-----|------------------------|
-| **Auto-reindex** on worktree/`UpdatedEntries` / `Cargo.toml` edits | **Not wired.** `invalidation_scope_for_path` exists; store only does full `reindex`. Spec §9.3 #3 (“Edit Cargo.toml member → graph updates without restart”) is unmet unless you Reindex. **In progress on this branch** — grep `UpdatedEntries` / `reindex_semantic_graph` in `project.rs` and `store.rs` before adding a second scheduler. |
+| **Auto-reindex** on worktree/`UpdatedEntries` / `Cargo.toml` edits | **Wired in the panel** (`should_reindex_path` + 500ms GPUI timer debounce on `WorktreeUpdatedEntries`). Still a full `reindex`, not incremental patches. `invalidation_scope_for_path` in `semantic_graph` is unused by the live scheduler — do not add a second scheduler in `Project` without deleting the panel one. |
 | **LLM intent** | Stub in `llm_provider.rs`. No `language_model` routing, no cache file. |
 | **Remote / SSH extraction** | Store is created on remote projects, but extract runs **client-side on the local worktree root** via `reindex_semantic_graph`. No proto (`GetSemanticGraphSnapshot`, etc.). Spec §12 / A.5. |
 | **Full `mod` parse** | `rust_modules.rs` is FS walk only (`src/*.rs`, `src/*/`). Inline `mod foo;` / `#[path]` not modeled. Tree-sitter follow-up. |
@@ -166,7 +166,7 @@ Be honest. If a gap looks freshly fixed, **verify in code** before re-implementi
 | **Incremental patches** | `apply_patch` exists; live path is wipe + full rebuild. |
 | **Multi-worktree** | Reindex uses first visible worktree only. |
 | **UML / C4 skins** | Not implemented. `default_skin` is stored; only `vibe` paints. |
-| **Canvas zoom / double-click open** | **In progress on this branch** (uncommitted `canvas/item.rs` / `element.rs` at handoff time). User doc canvas section may already describe scroll-zoom. Verify in code; do not revert that work. |
+| **Canvas zoom / double-click open** | **Done.** Wheel zoom in `canvas/item.rs` (`clamp_zoom`); double-click below pin threshold calls `open_node_source`. |
 | **Call graphs, Type/Calls drill-down** | Not extracted / not shown. |
 | **Collab-shared pins** | Canvas pins are workspace KVP only. |
 | **Agent overlays / tools** | No `agent` / `agent_ui` / `action_log` references. Phase C. |
@@ -289,7 +289,8 @@ cargo check -p zed
 Useful fixtures/tests:
 
 - `semantic_graph`: cargo glob members, cluster pins, `nodes_for_path`, reindex Indexing→Idle / Partial, static intents, rust module walk, invalidation scope classification.
-- `semantic_map_ui`: settings defaults (`enabled == false`, `intent.llm == false`), panel GPUI test, canvas pin-threshold GPUI test, view-model collectors.
+- `semantic_map_ui`: settings defaults (`enabled == false`, `intent.llm == false`), panel GPUI test, canvas pin-threshold / zoom / double-click classification tests, view-model collectors, `should_reindex_path`.
+- Dogfood: `build_initial_graph` on this Zed checkout (`max_auto_nodes` 500, depth 2) must stay green (`gpui` / `editor` / `project` modules present).
 
 GPUI tests: use `cx.background_executor().timer(...)`, not `smol::Timer`.
 
