@@ -437,24 +437,25 @@ mod tests {
 
         for expected in ["app", "core_lib"] {
             assert!(
-                panel.rows.iter().any(|row| row.name.as_ref() == expected),
-                "panel should list {expected}, rows={:?}",
+                panel.rows.iter().any(|row| {
+                    row.name.as_ref() == expected && row.kind == NodeKind::Module
+                }),
+                "panel should list module {expected}, rows={:?}",
                 panel
                     .rows
                     .iter()
-                    .map(|row| row.name.to_string())
+                    .map(|row| (row.name.to_string(), row.kind))
                     .collect::<Vec<_>>()
             );
             assert!(
+                canvas.nodes.iter().any(|node| {
+                    node.title.as_ref() == expected && node.kind == NodeKind::Module
+                }),
+                "canvas should show a card for module {expected}, titles={:?}",
                 canvas
                     .nodes
                     .iter()
-                    .any(|node| node.title.as_ref() == expected),
-                "canvas should show a card for {expected}, titles={:?}",
-                canvas
-                    .nodes
-                    .iter()
-                    .map(|node| node.title.to_string())
+                    .map(|node| (node.title.to_string(), node.kind))
                     .collect::<Vec<_>>()
             );
         }
@@ -462,8 +463,8 @@ mod tests {
         let core_lib_row = panel
             .rows
             .iter()
-            .find(|row| row.name.as_ref() == "core_lib")
-            .expect("core_lib panel row");
+            .find(|row| row.name.as_ref() == "core_lib" && row.kind == NodeKind::Module)
+            .expect("core_lib module panel row");
         let core_lib_intent = core_lib_row
             .intent_summary
             .as_ref()
