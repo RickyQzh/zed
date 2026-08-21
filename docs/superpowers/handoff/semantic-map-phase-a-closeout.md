@@ -44,6 +44,10 @@ Highest-signal: `dogfood_zed_workspace_indexes_well_known_crates`,
 `reindex_keeps_last_snapshot_until_build_applies`,
 `should_reindex_path_classifies_structural_changes`.
 
+Verified: `cargo test -p semantic_graph --lib` (43 passed),
+`cargo test -p semantic_map_ui --lib` (23 passed),
+`CXX=g++ cargo check -p zed`.
+
 Headless environment cannot run the full Zed GUI. Canvas pan/zoom/drag and
 View-menu discoverability are unit/code-review, not a GUI loop.
 

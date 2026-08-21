@@ -561,6 +561,8 @@ impl Panel for SemanticMapPanel {
     }
 
     fn enabled(&self, _cx: &App) -> bool {
+        // Always listed so View → Semantic Map can show the enable hint.
+        // Indexing and canvas actions stay gated on SemanticMapSettings::enabled.
         true
     }
 }

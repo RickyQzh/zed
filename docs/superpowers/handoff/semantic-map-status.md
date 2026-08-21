@@ -306,7 +306,10 @@ cargo test -p semantic_map_ui --lib
 cargo check -p zed
 ```
 
-Re-run these; do not trust stale pass counts. Last closeout was ~38 `semantic_graph` + ~19 `semantic_map_ui` before the workspace-dep / orientation-lens / location work.
+Re-run these; do not trust stale pass counts. Verified this closeout:
+`cargo test -p semantic_graph --lib` **43 passed**,
+`cargo test -p semantic_map_ui --lib` **23 passed**,
+`CXX=g++ cargo check -p zed` **ok**.
 
 Useful fixtures/tests:
 

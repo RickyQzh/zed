@@ -238,7 +238,7 @@ pub fn cluster_subsystems(
         } else {
             affinity_score(graph, &members)
         };
-        let location = first_member_location(graph, &members);
+        let location = member_location_for_subsystem(graph, &slug, &members);
         upsert_nodes.push(
             Node::subsystem(
                 subsystem_id,
@@ -279,15 +279,37 @@ pub fn cluster_subsystems(
     })
 }
 
-fn first_member_location(graph: &SemanticGraph, members: &[NodeId]) -> Option<SourceLocation> {
-    let mut members = members.to_vec();
-    members.sort();
-    members.iter().find_map(|module_id| {
-        graph
-            .nodes
-            .get(module_id)
-            .and_then(|node| node.location.clone())
-    })
+fn member_location_for_subsystem(
+    graph: &SemanticGraph,
+    slug: &str,
+    members: &[NodeId],
+) -> Option<SourceLocation> {
+    let mut candidates: Vec<&Node> = members
+        .iter()
+        .filter_map(|module_id| graph.nodes.get(module_id))
+        .filter(|node| node.location.is_some())
+        .collect();
+    candidates.sort_by(|left, right| {
+        member_open_rank(slug, left)
+            .cmp(&member_open_rank(slug, right))
+            .then_with(|| left.display_name.as_ref().cmp(right.display_name.as_ref()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates.first().and_then(|node| node.location.clone())
+}
+
+fn member_open_rank(slug: &str, node: &Node) -> (u8, u8) {
+    let test_rank = u8::from(node.flags.is_test);
+    let name = node.display_name.as_ref();
+    let slug_norm = slug.replace('-', "_");
+    let name_fit = if name == slug || name == slug_norm {
+        0
+    } else if slug.starts_with(name) || slug_norm.starts_with(name) {
+        1
+    } else {
+        2
+    };
+    (test_rank, name_fit)
 }
 
 fn assign_unpinned_by_prefix_or_other(
@@ -806,5 +828,38 @@ subsystem = "agent"
                 node.display_name
             );
         }
+    }
+
+    #[test]
+    fn subsystem_location_prefers_namesake_member() {
+        let (mut graph, ids) = graph_with_modules(&["editor", "language"], &[]);
+        cluster_and_apply(
+            &mut graph,
+            ClusterConfig::default(),
+            &PinConfig {
+                subsystems: vec![PinnedSubsystem {
+                    slug: "editing".into(),
+                    members: vec!["crates/editor".into(), "crates/language".into()],
+                    summary: None,
+                }],
+                module_pins: Vec::new(),
+            },
+        );
+
+        let editing = graph
+            .nodes
+            .values()
+            .find(|node| {
+                node.kind == NodeKind::Subsystem && node.display_name.as_ref() == "editing"
+            })
+            .expect("editing subsystem");
+        let editor_location = graph
+            .nodes
+            .get(&ids["editor"])
+            .and_then(|node| node.location.clone());
+        assert_eq!(
+            editing.location, editor_location,
+            "double-click editing should open editor"
+        );
     }
 }
