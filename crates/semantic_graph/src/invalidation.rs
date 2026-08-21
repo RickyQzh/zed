@@ -274,7 +274,7 @@ fn apply_rust_module_depth(
     Ok(truncated)
 }
 
-/// Sync test helper wrapping [`build_initial_graph`] into a snapshot.
+/// Sync helper wrapping [`build_initial_graph`] into a snapshot (tests and UI).
 pub struct GraphIndexer;
 
 impl GraphIndexer {
@@ -282,8 +282,15 @@ impl GraphIndexer {
         root: &Path,
         worktree_id: WorktreeId,
     ) -> Result<SemanticGraphSnapshot> {
-        let (graph, intents, truncated) =
-            build_initial_graph(root, worktree_id, BuildGraphOptions::default())?;
+        Self::reindex_with_options(root, worktree_id, BuildGraphOptions::default())
+    }
+
+    pub fn reindex_with_options(
+        root: &Path,
+        worktree_id: WorktreeId,
+        options: BuildGraphOptions,
+    ) -> Result<SemanticGraphSnapshot> {
+        let (graph, intents, truncated) = build_initial_graph(root, worktree_id, options)?;
         Ok(SemanticGraphSnapshot {
             revision: graph.revision(),
             graph: Arc::new(graph),
