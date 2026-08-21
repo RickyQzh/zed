@@ -438,7 +438,7 @@ fn project_path_from_source_location(location: &SourceLocation) -> ProjectPath {
     }
 }
 
-fn open_node_source(
+pub(crate) fn open_node_source(
     workspace: &WeakEntity<Workspace>,
     project: &Entity<Project>,
     node_id: NodeId,
