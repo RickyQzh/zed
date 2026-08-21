@@ -30,6 +30,12 @@ impl StaticIntentProvider {
         let updated_at = Timestamp(unix_millis_now());
 
         for node in graph.nodes.values() {
+            if node.kind == NodeKind::Project {
+                if let Some(intent) = project_readme_intent(root, node, updated_at)? {
+                    intents.push(intent);
+                }
+                continue;
+            }
             if node.kind != NodeKind::Module {
                 continue;
             }
@@ -226,10 +232,7 @@ fn cargo_description_evidence(
         return Ok(None);
     };
 
-    let worktree_id = match &node.key {
-        crate::NodeKey::Module { worktree_id, .. } => *worktree_id,
-        _ => WorktreeId::from_usize(0),
-    };
+    let worktree_id = worktree_id_from_node(node);
     let rel = rel_path_from_root(workspace_root, &manifest)?;
     Ok(Some((
         description,
@@ -261,10 +264,7 @@ fn readme_evidence(
         return Ok(None);
     }
 
-    let worktree_id = match &node.key {
-        crate::NodeKey::Module { worktree_id, .. } => *worktree_id,
-        _ => WorktreeId::from_usize(0),
-    };
+    let worktree_id = worktree_id_from_node(node);
     let rel = rel_path_from_root(workspace_root, &readme_path)?;
     Ok(Some((
         heading,
@@ -285,24 +285,21 @@ fn parse_readme_heading_and_paragraph(text: &str) -> (String, String) {
 
     for line in text.lines() {
         let trimmed = line.trim();
-        if !past_heading {
-            if trimmed.is_empty() {
-                continue;
+        if is_skippable_readme_line(trimmed) {
+            if !paragraph_lines.is_empty() {
+                break;
             }
+            continue;
+        }
+        if !past_heading {
             if let Some(rest) = trimmed.strip_prefix('#') {
                 heading = rest.trim_start_matches('#').trim().to_string();
                 past_heading = true;
                 continue;
             }
-            // No ATX heading — treat first non-empty line as paragraph start.
+            // No ATX heading — treat first non-empty prose line as paragraph start.
             past_heading = true;
             paragraph_lines.push(trimmed);
-            continue;
-        }
-        if trimmed.is_empty() {
-            if !paragraph_lines.is_empty() {
-                break;
-            }
             continue;
         }
         if trimmed.starts_with('#') && paragraph_lines.is_empty() {
@@ -312,6 +309,65 @@ fn parse_readme_heading_and_paragraph(text: &str) -> (String, String) {
     }
 
     (heading, paragraph_lines.join(" "))
+}
+
+fn is_skippable_readme_line(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return true;
+    }
+    let without_align = trimmed.trim_start_matches('|').trim();
+    if without_align.starts_with("![") || without_align.starts_with("[![") {
+        return true;
+    }
+    let break_chars: Vec<char> = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    !break_chars.is_empty()
+        && break_chars.len() >= 3
+        && break_chars
+            .iter()
+            .all(|c| matches!(c, '-' | '*' | '_' | '='))
+}
+
+fn worktree_id_from_node(node: &Node) -> WorktreeId {
+    match &node.key {
+        crate::NodeKey::Project { worktree_id } | crate::NodeKey::Module { worktree_id, .. } => {
+            *worktree_id
+        }
+        _ => WorktreeId::from_usize(0),
+    }
+}
+
+fn project_readme_intent(root: &Path, node: &Node, updated_at: Timestamp) -> Result<Option<Intent>> {
+    let Some((heading, paragraph, location)) = readme_evidence(root, node, root)? else {
+        return Ok(None);
+    };
+    let summary = if !paragraph.is_empty() {
+        paragraph.clone()
+    } else if !heading.is_empty() {
+        heading.clone()
+    } else {
+        return Ok(None);
+    };
+    let excerpt = match (heading.as_str(), paragraph.as_str()) {
+        (h, p) if !h.is_empty() && !p.is_empty() => format!("{h}\n\n{p}"),
+        (h, _) if !h.is_empty() => h.to_string(),
+        (_, p) => p.to_string(),
+    };
+    let evidence = vec![Evidence {
+        kind: EvidenceKind::ReadmeSection,
+        location,
+        excerpt: SharedString::from(excerpt),
+        weight: 1.0,
+    }];
+    Ok(Some(Intent {
+        subject: node.id,
+        summary: SharedString::from(summary),
+        bullets: Vec::new(),
+        confidence: Confidence::High,
+        source: IntentSource::Static,
+        evidence,
+        updated_at,
+        content_hash: hash_evidence(&evidence),
+    }))
 }
 
 fn rel_path_from_root(root: &Path, absolute: &Path) -> Result<Arc<RelPath>> {
@@ -344,9 +400,9 @@ mod tests {
 
     use worktree::WorktreeId;
 
-    use super::StaticIntentProvider;
+    use super::{parse_readme_heading_and_paragraph, StaticIntentProvider};
     use crate::extract::extract_cargo_workspace;
-    use crate::{NodeKind, SemanticGraph};
+    use crate::{GraphPatch, Node, NodeId, NodeKey, NodeKind, SemanticGraph};
 
     #[test]
     fn static_intent_uses_crate_description() {
@@ -379,6 +435,56 @@ mod tests {
                 .iter()
                 .map(|evidence| evidence.excerpt.to_string())
                 .collect::<Vec<_>>()
+        );
+        assert_eq!(intent.source, crate::IntentSource::Static);
+    }
+
+    #[test]
+    fn parse_readme_skips_badges_and_rules_for_first_paragraph() {
+        let text = "# Zed\n\n[![CI](https://example.com/badge.svg)](https://example.com)\n\n---\n\nWelcome to Zed, a high-performance, multiplayer code editor.\n";
+        let (heading, paragraph) = parse_readme_heading_and_paragraph(text);
+        assert_eq!(heading, "Zed");
+        assert!(
+            paragraph.to_lowercase().contains("high-performance"),
+            "expected prose paragraph, got {paragraph:?}"
+        );
+        assert!(
+            !paragraph.contains("badge"),
+            "badge markup should not become the first paragraph, got {paragraph:?}"
+        );
+    }
+
+    #[test]
+    fn static_intent_lifts_root_readme_onto_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("README.md"),
+            "# Zed\n\n[![CI](https://example.com/badge.svg)](https://example.com)\n\nWelcome to Zed, a high-performance, multiplayer code editor.\n",
+        )
+        .unwrap();
+
+        let worktree_id = WorktreeId::from_usize(1);
+        let key = NodeKey::Project { worktree_id };
+        let id = NodeId::from_key(&key);
+        let mut graph = SemanticGraph::default();
+        graph
+            .apply_patch(GraphPatch {
+                base: graph.revision(),
+                removed_nodes: vec![],
+                removed_edges: vec![],
+                upsert_nodes: vec![Node::project(id, key, "workspace")],
+                upsert_edges: vec![],
+            })
+            .unwrap();
+
+        let intents = StaticIntentProvider::enrich(&graph, root).unwrap();
+        let intent = intents.get(&id).expect("project node should have a README intent");
+        assert!(
+            intent.summary.to_lowercase().contains("high-performance")
+                && intent.summary.to_lowercase().contains("multiplayer"),
+            "expected root README paragraph on the Project node, got {:?}",
+            intent.summary
         );
         assert_eq!(intent.source, crate::IntentSource::Static);
     }
