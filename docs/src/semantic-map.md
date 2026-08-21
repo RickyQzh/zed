@@ -102,9 +102,9 @@ static intent on the map.
 
 - Cargo `workspace.members` globs such as `crates/*` are expanded; exclude
   lists and full Cargo glob parity are not guaranteed.
-- The map does not rebuild when you edit files. Use
-  {#action semantic_map::Reindex} after large project or
-  `semantic_map.toml` changes.
+- Structural edits (`Cargo.toml`, `semantic_map.toml`, files under `src/`)
+  trigger a debounced full reindex while the feature is enabled. Use
+  {#action semantic_map::Reindex} to rebuild immediately.
 
 ## Status {#status}
 
