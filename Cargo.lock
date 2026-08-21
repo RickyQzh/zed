@@ -16613,7 +16613,6 @@ dependencies = [
  "collections",
  "globset",
  "gpui",
- "parking_lot",
  "pretty_assertions",
  "serde",
  "serde_json",

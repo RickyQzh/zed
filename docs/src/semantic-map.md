@@ -160,7 +160,7 @@ repository by default.
 
 | Setting                                         | Default | Purpose                                      |
 | ----------------------------------------------- | ------- | -------------------------------------------- |
-| `semantic_map.enabled`                          | `false` | Master gate for panel and canvas             |
+| `semantic_map.enabled`                          | `false` | Master gate for indexing and canvas. The panel can still open to show an enable hint |
 | `semantic_map.auto_open_canvas_on_project_open` | `false` | Open canvas when a project opens             |
 | `semantic_map.hide_external`                    | `true`  | Hide external dependency nodes               |
 | `semantic_map.hide_tests`                       | `true`  | Hide modules flagged as tests (`*_test` / `*_tests` crate names). No-op if the extractor did not set the flag |
